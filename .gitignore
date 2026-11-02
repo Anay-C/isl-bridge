@@ -1,0 +1,10 @@
+data/
+.venv/
+.venv-ml/
+node_modules/
+dist/
+.env
+*.pt
+*.onnx
+__pycache__/
+.idea/
