@@ -296,3 +296,7 @@ a.pill { text-decoration: none; }
 .about .row { display: flex; gap: 8px; }
 .about .row button { flex: 1; padding: 12px; border-radius: 12px; border: none; background: var(--accent); color: #fff; font-weight: 700; font-size: 16px; }
 .about .row button.secondary { background: var(--card); color: var(--fg); border: 1px solid var(--line); }
+.bubble .waiting { color: var(--accent); animation: wait-pulse 1.4s ease-in-out infinite; }
+@keyframes wait-pulse { 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .bubble .waiting { animation: none; } }
+.bubble .failed { color: var(--danger); }

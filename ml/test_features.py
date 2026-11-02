@@ -26,7 +26,7 @@ from test_ws import frames_msgs  # noqa: E402
 
 BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000").rstrip("/")
 WS = BASE.replace("https://", "wss://").replace("http://", "ws://") + "/ws/sign"
-LOCAL = "127.0.0.1" in BASE or "localhost" in BASE
+LOCAL = "127.0.0.1" in BASE or "localhost" in BASE or len(sys.argv) > 2  # data folder given: same machine
 KP = Path(__file__).resolve().parent.parent / "data"  # test clips (INCLUDE keypoints)
 # the server's data folder, for the file checks (a staged Space bundle has its own: data/space_build/data)
 DATA = Path(sys.argv[2]) if len(sys.argv) > 2 else KP
@@ -220,7 +220,7 @@ async def main():
     st, j = http("/api/text", {"text": "Take one tablet after food", "scenario": "hospital"})
     check("typed reply -> ISL playlist", st == 200 and j.get("playlist"), f"{st} {[x.get('sign') or x.get('fingerspell') for x in (j or {}).get('playlist', [])]}")
     if public:
-        codes = [http("/api/text", {"text": ""})[0] for _ in range(25)]
+        codes = [http("/api/text", {"text": ""})[0] for _ in range(45)]
         check("public: typed replies are rate-limited per device", 429 in codes, f"codes {sorted(set(codes))}")
         st, _ = http("/api/compose", {"candidates": []})
         check("public: debug route /api/compose is off", st == 404, f"{st}")

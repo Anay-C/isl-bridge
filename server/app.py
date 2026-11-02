@@ -100,9 +100,10 @@ class Rate:
         return True
 
 
-RATE_HTTP = Rate(int(os.environ.get("HTTP_PER_MIN", 20)))  # typed / spoken replies per client IP
+# typed / spoken replies per client IP (generous: testers on one Wi-Fi or a mobile carrier share an IP)
+RATE_HTTP = Rate(int(os.environ.get("HTTP_PER_MIN", 40)))
 RATE_LENS = Rate(int(os.environ.get("LENS_PER_MIN", 8)))
-RATE_SPEECH = Rate(int(os.environ.get("SPEECH_PER_MIN", 20)))
+RATE_SPEECH = Rate(int(os.environ.get("SPEECH_PER_MIN", 40)))
 
 
 def client_ip(r):
@@ -866,6 +867,8 @@ async def ws_speech(ws: WebSocket):
                 if not text:
                     await ws.send_text(json.dumps({"type": "error", "message": "no speech heard"}))
                     continue
+                # captions first: the Deaf person can read what was said while Spark puts it into ISL (4-10 s)
+                await ws.send_text(json.dumps({"type": "transcript", "text": text}, ensure_ascii=False))
                 try:
                     g, playlist, fetch_ms = await text_to_sign(text, scenario)
                 except Exception as e:

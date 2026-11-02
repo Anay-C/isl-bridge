@@ -25,20 +25,53 @@ LEDGER = Path(__file__).resolve().parent.parent / "data" / "meta_spend.json"
 TAG = os.getenv("META_SPEND_TAG", "app")  # purpose label for the ledger (e.g. "eval_context")
 
 
+class _LedgerLock:
+    """Cross-process lock (a lock file): the LAN server, the public one (deploy/share.py) and eval scripts may
+    write the same ledger at the same moment; without it one of two simultaneous calls would be lost."""
+
+    def __init__(self, timeout=5.0):
+        self.path, self.timeout, self.fd = LEDGER.with_suffix(".lock"), timeout, None
+
+    def __enter__(self):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < self.timeout:
+            try:
+                self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                return self
+            except (FileExistsError, PermissionError):  # Windows: PermissionError while the old one is deleted
+                try:  # left behind by a killed process
+                    if time.time() - self.path.stat().st_mtime > 10:
+                        self.path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                time.sleep(0.01)
+        return self  # never block a conversation on bookkeeping: write without the lock
+
+    def __exit__(self, *a):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.path.unlink(missing_ok=True)
+
+
 def _log_spend(kind, usd, **counts):
     try:
-        led = json.loads(LEDGER.read_text()) if LEDGER.exists() else {}
-        e = led.setdefault(f"{TAG}/{kind}", {"calls": 0, "usd": 0.0})
-        e["calls"] += 1
-        e["usd"] = round(e["usd"] + usd, 6)
-        for k, v in counts.items():
-            e[k] = e.get(k, 0) + v
-        led["_total_usd"] = round(sum(v["usd"] for k, v in led.items() if not k.startswith("_")), 4)
-        tmp = LEDGER.with_suffix(".tmp")  # atomic: a full disk must not wipe the ledger
-        tmp.write_text(json.dumps(led, indent=1))
-        tmp.replace(LEDGER)
+        with _LedgerLock():
+            _write_spend(kind, usd, counts)
     except Exception:
         pass  # never break a conversation over bookkeeping
+
+
+def _write_spend(kind, usd, counts):
+    led = json.loads(LEDGER.read_text()) if LEDGER.exists() else {}
+    e = led.setdefault(f"{TAG}/{kind}", {"calls": 0, "usd": 0.0})
+    e["calls"] += 1
+    e["usd"] = round(e["usd"] + usd, 6)
+    for k, v in counts.items():
+        e[k] = e.get(k, 0) + v
+    led["_total_usd"] = round(sum(v["usd"] for k, v in led.items() if not k.startswith("_")), 4)
+    tmp = LEDGER.with_suffix(f".{os.getpid()}.tmp")  # atomic: a full disk must not wipe the ledger
+    tmp.write_text(json.dumps(led, indent=1))
+    tmp.replace(LEDGER)
 
 
 def spent():
