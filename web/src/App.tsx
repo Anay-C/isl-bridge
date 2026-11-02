@@ -10,7 +10,9 @@ import Ghost, { ghostMs, loadGhost, type GhostRef } from './Ghost'
 type Cand = { label: string; p: number }
 // cands: the top-3 per sign that Muse Spark chose from; chosen: what it picked (shows context corrections);
 // sid: the server's id of a signed sentence ("✏️ Wrong?" reports refer to it)
-type Turn = { who: 'deaf' | 'hearing'; text: string; sub?: string; ms?: number; playlist?: Clip[]; cands?: Cand[][]; chosen?: string[]; typed?: boolean; sid?: number; reported?: boolean }
+type Turn = { who: 'deaf' | 'hearing'; text: string; sub?: string; ms?: number; playlist?: Clip[]; cands?: Cand[][]; chosen?: string[]; typed?: boolean; sid?: number; reported?: boolean
+  // hearing turns: shown as soon as the words are known (captions first), the ISL signs follow
+  waiting?: boolean; failed?: boolean }
 type Fix = { turn: number; sid?: number; signs: string[]; meant: string[]; note: string } | null
 
 // Every device gets its own private profile (taught signs). Anay's own setup (localhost / home Wi-Fi) keeps
@@ -347,15 +349,22 @@ export default function App() {
     sock.onmessage = (ev) => {
       const m = JSON.parse(ev.data)
       if (m.type === 'partial') setLive(m.text)
+      else if (m.type === 'transcript') { setLive(''); showWords(m.text) }
       else if (m.type === 'result') { done = true; setLive(''); showReply(m); sock.close() }
       else if (m.type === 'error') {
         if (speechSock.current === sock) speechSock.current = null  // still talking: upload the WAV on release
-        if (sentEnd) { done = true; setLive(''); setStatus(m.message === 'no speech heard' ? 'No speech heard — hold the mic and speak' : `Speech error: ${m.message}`) }
+        if (sentEnd) {
+          done = true; setLive('')
+          settleWaiting((t) => ({ ...t, waiting: false, failed: true }))
+          setStatus(m.message === 'no speech heard' ? 'No speech heard — hold the mic and speak' : `Speech error: ${m.message}`)
+        }
         sock.close()
       }
     }
     sock.onerror = () => { if (speechSock.current === sock) speechSock.current = null }
-    sock.onclose = () => { if (sentEnd && !done) { setLive(''); setStatus('Speech translation failed — try again or type ⌨️') } }
+    sock.onclose = () => {
+      if (sentEnd && !done) { setLive(''); settleWaiting((t) => ({ ...t, waiting: false, failed: true })); setStatus('Speech translation failed — try again or type ⌨️') }
+    }
     ;(sock as WebSocket & { markEnd?: () => void }).markEnd = () => { sentEnd = true }
     speechSock.current = sock
     const r = new WavRecorder((pcm) => {
@@ -395,8 +404,18 @@ export default function App() {
   }
 
   // hearing person's reply (spoken or typed) -> captions + ISL clips
+  // captions first: the hearing person's words appear at once; showReply fills in the ISL signs (Spark, 4-10 s)
+  const showWords = (text: string, typed = false) => setTurns((t) => [...t, { who: 'hearing', text, typed, waiting: true }])
+  const settleWaiting = (f: (t: Turn) => Turn) => setTurns((ts) => {
+    const i = ts.map((t) => t.who === 'hearing' && t.waiting).lastIndexOf(true)
+    return i < 0 ? ts : ts.map((t, j) => (j === i ? f(t) : t))
+  })
   const showReply = (j: { caption: string; playlist: Clip[]; latency_ms: { total: number } }, typed = false) => {
-    setTurns((t) => [...t, { who: 'hearing', text: j.caption, sub: j.playlist.map((c: Clip) => c.sign ? pretty(c.sign) : `“${c.fingerspell}”`).join(' · '), ms: j.latency_ms.total, playlist: j.playlist, typed }])
+    const turn: Turn = { who: 'hearing', text: j.caption, sub: j.playlist.map((c: Clip) => c.sign ? pretty(c.sign) : `“${c.fingerspell}”`).join(' · '), ms: j.latency_ms.total, playlist: j.playlist, typed }
+    setTurns((ts) => {
+      const i = ts.map((t) => t.who === 'hearing' && t.waiting).lastIndexOf(true)
+      return i < 0 ? [...ts, turn] : ts.map((t, k) => (k === i ? turn : t))
+    })
     send({ type: 'reply', text: j.caption })
     setCaption(j.caption)
     setPlaylist(j.playlist)
@@ -415,15 +434,24 @@ export default function App() {
       }
       showReply(await r.json(), typed)
     } catch (e) {
+      settleWaiting((t) => ({ ...t, waiting: false, failed: true }))
       setStatus(`Translation error: ${(e as Error).message.slice(0, 120)}`)
     }
+  }
+  const replyText = (text: string) =>
+    fetch('/api/text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, scenario }) })
+  const retryReply = (i: number) => {  // a reply that could not be put into ISL: tap its bubble to try again
+    const t = turns[i]
+    setTurns((ts) => ts.map((x, j) => (j === i ? { ...x, waiting: true, failed: false } : x)))
+    toSign(replyText(t.text), t.typed)
   }
   const sendTyped = () => {
     const text = typed.trim()
     if (!text) return
     setTyped('')
     setTypeOpen(false)
-    toSign(fetch('/api/text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, scenario }) }), true)
+    showWords(text, true)
+    toSign(replyText(text), true)
   }
 
   const captureFrame = () => {  // unmirrored camera frame for ISL Lens
@@ -663,14 +691,16 @@ export default function App() {
             )}
             {turns.map((t, i) => (
               <div key={i} className={`bubble ${t.who}`} title={t.who === 'hearing' ? 'Tap to sign it again' : 'Tap to speak it again'}
-                onClick={() => { if (t.who === 'deaf') sayAloud(t.text, lang); else if (t.playlist?.length) { setCaption(t.text); setPlaylist(t.playlist); setClipIdx(0) } }}>
+                onClick={() => { if (t.who === 'deaf') sayAloud(t.text, lang); else if (t.failed) retryReply(i); else if (t.playlist?.length) { setCaption(t.text); setPlaylist(t.playlist); setClipIdx(0) } }}>
                 <div className="who">{t.who === 'deaf' ? '🤟 Signed' : t.typed ? '⌨️ Typed' : '🎤 Said'}</div>
                 <div className="text">{t.text}</div>
                 {t.who === 'deaf' && t.cands?.length
                   ? <SignTrail cands={t.cands} chosen={t.chosen ?? []} />
                   : t.who === 'hearing' && t.playlist?.length
                     ? <div className="trail">{t.playlist.map((c, j) => <span key={j} className={`tchip ${c.dictionary ? 'dict' : ''} ${c.sign ? '' : 'spell'}`}>{c.sign ? pretty(c.sign) : c.fingerspell}</span>)}</div>
-                    : t.sub && <small>{t.sub}</small>}
+                    : t.waiting ? <small className="waiting">⏳ Putting it into ISL signs…</small>
+                      : t.failed ? <small className="failed">⚠ Couldn't show this in ISL signs. Tap to try again.</small>
+                        : t.sub && <small>{t.sub}</small>}
                 {t.ms ? <small className="ms">{t.who === 'deaf' ? 'Muse Spark' : 'to ISL'} · {(t.ms / 1000).toFixed(1)} s{t.who === 'hearing' && t.playlist?.length ? ' · tap to replay ▶' : ''}</small> : null}
                 {t.who === 'deaf' && t.sid !== undefined && (t.reported
                   ? <small className="reported">✓ Reported, thanks</small>

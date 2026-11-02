@@ -106,7 +106,8 @@ def _fetch_blocking(path):
         return dst
     src = hf_hub_download(REPO, path, repo_type="dataset", local_dir=RAW)
     CACHE.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_suffix(".tmp.mp4")
+    import os
+    tmp = dst.with_suffix(f".{os.getpid()}.tmp.mp4")  # two servers (LAN + public) may fetch the same clip
     # signer stands in the middle; the word label (left) and ISLRTC logo (bottom right) fall outside this crop
     vf = "crop=iw*0.5:ih:iw*0.25:0,scale=-2:480,fps=25,format=yuv420p"
     subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error", "-i", str(src), "-vf", vf, "-an",
@@ -127,3 +128,47 @@ async def fetch_clip(path):
 
 
 _locks: dict[str, asyncio.Lock] = {}
+
+
+# Words a doctor, nurse or pharmacist often says that have no app clip: their dictionary clips are fetched ahead
+# of time (python server/dictionary.py --prefetch), so a reply never waits for a first download (~3 s each).
+COMMON_REPLY_WORDS = """take give come go back wait sit stand lie sleep rest eat drink breathe swallow open close show
+tell write read call pay bring buy check test measure wash clean apply use stop start finish need want feel walk keep
+avoid return visit admit discharge operate inject examine scan weigh cough sneeze bleed understand know think remember
+forget worry relax wear remove change repeat follow allow high low normal good bad better worse hot cold warm big small
+more less again later now soon early late slowly fast careful important serious safe free ready empty full every daily
+twice once after before since until always never sometimes only blood sugar urine pressure report result appointment
+bed room ward floor lift stairs money fee card form name address age weight height sample syrup drip bandage cream
+drops eye ear nose throat chest leg arm hand foot skin tooth teeth heart lung kidney liver bone infection diabetes
+operation surgery scan week month day night evening hour time milk tea rice fruit family husband wife child baby
+friend pharmacy prescription insurance number two three four five ten half breakfast lunch dinner meal empty stomach
+increase decrease sign yes no okay sorry welcome""".split()
+
+
+def prefetch(words=COMMON_REPLY_WORDS, clip_labels=()):
+    """Download + convert the top dictionary entry for each word (skips words the app has a clip for)."""
+    have = {c.lower() for c in clip_labels}
+    todo = []
+    for w in dict.fromkeys(words):
+        if w in have or w in STOP:
+            continue
+        hits = search(w, k=1, min_score=37)
+        if hits and hits[0]["id"] not in todo:
+            todo.append(hits[0]["id"])
+    done = 0
+    for i, path in enumerate(todo):
+        try:
+            _fetch_blocking(path)
+            done += 1
+        except Exception as e:
+            print(f"  {path}: {e!r}"[:200], flush=True)
+        if (i + 1) % 25 == 0:
+            print(f"  {i + 1}/{len(todo)}", flush=True)
+    print(f"prefetched {done}/{len(todo)} dictionary clips into {CACHE}", flush=True)
+
+
+if __name__ == "__main__":
+    import sys
+    if "--prefetch" in sys.argv:
+        clips = [p.stem for p in (DATA / "clips").glob("*.mp4")]
+        prefetch(clip_labels=clips)
