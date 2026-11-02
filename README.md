@@ -107,6 +107,14 @@ Caveats we state up front: the unseen-signer sets are small; the context eval us
 Muse Spark; ISL varies by region, so accuracy on a new person depends on how close their variant is to the
 training communities. That is exactly why personalisation is built in.
 
+## Try it / share it with testers
+
+Double-click `deploy\share.bat` (or `.venv-ml/Scripts/python deploy/share.py`): it starts a public-mode server and a
+Cloudflare quick tunnel and prints a `https://….trycloudflare.com` link that works on any phone, anywhere, while
+the laptop is on. Testers get a welcome screen with a consent choice, their own private profile, **✏️ Wrong?** under
+every sentence, feedback and *delete my data*. `ml/tester_report.py` summarises what they found. Full guide:
+[TESTING.md](TESTING.md). A hosted version (Hugging Face Space) is packaged in `deploy/build_space.py`.
+
 ## Run it
 
 ```bash
@@ -117,7 +125,8 @@ cd web && npm install && npx vite --host        # https://localhost:5173 (phone:
 `.env` needs `MODEL_API_KEY` (Meta Model API). Optional: `ISL_DEVICE=cuda` (GPU inference),
 `ISL_MODEL=a.pt,b.pt,c.pt` (ensemble). Pages: `/` conversation, `/?learn` Ghost Coach, `/?record` data collection.
 
-Evaluations: `ml/test_signs.py` (every sign, held-out clips, live server path, per-sign report),
+End-to-end regression: `ml/test_features.py <url>` (24 checks over the real WebSocket + HTTP, incl. consent,
+reports, limits). Evaluations: `ml/test_signs.py` (every sign, held-out clips, live server path, per-sign report),
 `ml/test_ws.py` (every sign streamed over the real WebSocket, fuzzed), `ml/eval_live.py` (unseen signers, live
 pipeline), `ml/eval_islvt.py` (signer from another region), `ml/eval_words.py`, `ml/eval_personal_emergency.py`,
 `ml/eval_context.py`, `server/smoke_meta.py` (every Meta API call once).

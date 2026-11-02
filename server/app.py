@@ -18,6 +18,8 @@ import asyncio
 import json
 import os
 import re
+import secrets
+import shutil
 import sys
 import time
 import traceback
@@ -50,6 +52,8 @@ DATA = ROOT / "data"
 PUBLIC = os.environ.get("ISL_PUBLIC") == "1"  # open to the internet (Hugging Face Space)
 VERSION = os.environ.get("ISL_VERSION", "dev")
 FEEDBACK = DATA / "feedback"  # <user>.jsonl mistake reports (+ <user>/*.npz keypoints of corrected signs)
+# profiles nobody on the public link may open (profiles have no password; the LAN server shares data/users)
+PROTECTED = {u.strip() for u in os.environ.get("ISL_PROTECTED_USERS", "anay").split(",") if u.strip()}
 # ISL_MODEL: checkpoint(s) to serve, comma-separated = ensemble (ml/recognizer.py); ISL_DEVICE: cpu | cuda
 MODEL = os.environ.get("ISL_MODEL") or str(DATA / "model.pt")
 DEVICE = os.environ.get("ISL_DEVICE", "cpu")
@@ -107,9 +111,14 @@ RATE_SPEECH = Rate(int(os.environ.get("SPEECH_PER_MIN", 40)))
 
 
 def client_ip(r):
-    """Request or WebSocket -> the visitor's IP (behind the Hugging Face proxy: X-Forwarded-For)."""
-    xf = r.headers.get("x-forwarded-for", "")
-    return xf.split(",")[0].strip() or (r.client.host if r.client else "?")
+    """Request or WebSocket -> the visitor's IP, for the per-device limits. Behind the Cloudflare tunnel:
+    Cf-Connecting-Ip (Cloudflare sets it; a visitor cannot forge it through the tunnel). Otherwise the LAST
+    X-Forwarded-For hop (added by the nearest proxy; the first one is whatever the client claimed)."""
+    cf = r.headers.get("cf-connecting-ip", "").strip()
+    if cf:
+        return cf
+    hops = [x.strip() for x in r.headers.get("x-forwarded-for", "").split(",") if x.strip()]
+    return hops[-1] if hops else (r.client.host if r.client else "?")
 
 
 @asynccontextmanager
@@ -251,6 +260,7 @@ class Session:
         self.log_ok = True  # "help improve ISL Bridge": keep this person's sign keypoints (they can switch it off)
         self.spark = Rate(SPARK_PER_MIN)  # this signer's Meta calls in the last minute
         self.summaries = Rate(4)
+        self.feedbacks = Rate(20)
         self.client_logs = 0
         # "that was wrong" reports: the keypoints of the last stretches of signing, and for each pending sign
         # which stretch (and frames) it came from; spoken sentences keep their signs for a while
@@ -502,10 +512,32 @@ class Session:
                         cands=[[{"label": c["label"], "p": round(float(c["p"]), 3)} for c in top] for top in cands],
                         **out)
 
+    def delete_my_data(self):
+        """"Delete my data": this profile's taught signs, keypoint logs, reports and recordings. Returns the
+        number of files removed. Logging stops for the rest of the session."""
+        n = 0
+        for f in (self.user_file(), FEEDBACK / f"{self.user}.jsonl"):
+            if f.exists():
+                f.unlink()
+                n += 1
+        for d in (LIVE_LOG / self.user, FEEDBACK / self.user, RECORDINGS / self.user):
+            if d.is_dir():
+                n += sum(1 for x in d.rglob("*") if x.is_file())
+                shutil.rmtree(d, ignore_errors=True)
+        if self.rec is not None:
+            self.rec.samples, self.rec._trust_cache = {}, {}
+        self.log_ok = False
+        self.segs.clear()
+        self.sentences = {}
+        return n
+
     async def on_feedback(self, m):
         """"That was wrong": what the person really signed, per sign of a spoken sentence, and/or a note.
         Always saved to data/feedback/<user>.jsonl (they chose to send it); the keypoints of the corrected signs
         only while "help improve" is on. A corrected sign is also learned privately, like tap-to-correct."""
+        if not self.feedbacks.ok():
+            await self.send(type="error", message="Too many reports at once - wait a minute.")
+            return
         sid = m.get("sid")
         sent = self.sentences.get(sid) if isinstance(sid, int) else None
         fixes, learned, files = [], [], []
@@ -606,6 +638,8 @@ async def _dispatch(s, m):
         await s.on_frame(m)
     elif t == "hello":
         s.user = ("".join(ch for ch in str(m.get("user", "guest")) if ch.isalnum() or ch in "-_") or "guest")[:40]
+        if PUBLIC and s.user in PROTECTED:  # e.g. ?user=anay on the public link: a fresh tester profile instead
+            s.user = f"t-{secrets.token_hex(3)}"
         s.scenario = m.get("scenario", s.scenario) if m.get("scenario") in SCENARIOS else s.scenario
         s.learn = m.get("mode") == "learn"
         s.log_ok = m.get("log", True) is not False
@@ -620,7 +654,7 @@ async def _dispatch(s, m):
         await s.send(type="ready", model=s.rec is not None,
                      personal={k: len(v) for k, v in (s.rec.samples if s.rec else {}).items()},
                      vocab=s.rec.sign_labels() if s.rec else [], meta_ai=muse.KEY != "" and muse.budget_left() > 0,
-                     public=PUBLIC, version=VERSION, logging=s.log_ok)
+                     public=PUBLIC, version=VERSION, logging=s.log_ok, user=s.user)
     elif t == "scenario":  # switch scenario without losing the conversation
         if m.get("scenario") in SCENARIOS:
             s.scenario = m["scenario"]
@@ -693,6 +727,10 @@ async def _dispatch(s, m):
         s.log_ok = bool(m.get("log"))
     elif t == "feedback":
         await s.on_feedback(m)
+    elif t == "delete_me":
+        n = s.delete_my_data()
+        print(f"[privacy] {s.user}: deleted {n} files on request", flush=True)
+        await s.send(type="deleted", files=n)
     elif t == "summary":
         if not s.summaries.ok():
             await s.send(type="summary", **muse.plain_summary(s.history, "too many summaries - wait a minute"))
