@@ -16,6 +16,7 @@ Scoring (all on the unit sphere):
     sign agree at >= 0.6 in 59% of pairs, different signs only 3%.
 Probabilities = softmax(SCALE * score) over the active vocabulary.
 """
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -36,6 +37,8 @@ EX_DELTA = float(os.environ.get("EX_DELTA", "0.1"))  # "max": an exemplar match 
 EX_BETA = float(os.environ.get("EX_BETA", "0.5"))  # "blend": weight of the closest exemplar
 NONE = "_none_"
 SCALE = 16.0
+MODEL_KEY = "_model"  # profile key: fingerprint of the model the samples were taught with
+STALE_COS = 0.15
 
 
 class Recognizer:
@@ -148,18 +151,35 @@ class Recognizer:
                 "consistency": round(float(pair[~np.eye(len(S), dtype=bool)].mean()), 3),
                 "confused_with": sorted(confused, key=confused.get, reverse=True)}
 
+    def fingerprint(self):
+        """Identifies the model whose embedding space personal samples live in (a profile taught with another model
+        must not be compared: same size, meaningless cosines)."""
+        if getattr(self, "_fp", None) is None:
+            self._fp = hashlib.sha1(np.ascontiguousarray(self.weights).tobytes()).hexdigest()[:16]
+        return self._fp
+
     def save(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(json.dumps({k: [v.tolist() for v in vs] for k, vs in self.samples.items()}))
+        out = {k: [v.tolist() for v in vs] for k, vs in self.samples.items()}
+        out[MODEL_KEY] = self.fingerprint()
+        Path(path).write_text(json.dumps(out))
 
     def load(self, path):
         if Path(path).exists():
             raw = json.loads(Path(path).read_text())
+            fp = raw.pop(MODEL_KEY, None)
+            if fp is not None and fp != self.fingerprint():
+                print(f"[recognizer] {path}: taught with another model; personal signs must be re-taught", flush=True)
+                raw = {}
             # samples from a different model (other embedding size) cannot be compared: skip them (re-teach)
             self.samples = {k: [np.array(v, np.float32) for v in vs if len(v) == self.dim] for k, vs in raw.items()}
             stale = sorted(k for k, vs in self.samples.items() if not vs)
+            if fp is None:  # older profile without a model stamp: samples of a known sign that look like noise to
+                # this model (mean cos to their own class weight near 0; real samples sit at 0.3-0.8) are stale
+                stale += sorted(k for k, vs in self.samples.items() if vs and k in self._cid
+                                and float(np.mean(np.stack(vs) @ self.weights[self._cid[k]])) < STALE_COS)
             for k in stale:
-                del self.samples[k]
+                self.samples.pop(k, None)
             if stale:
                 print(f"[recognizer] {path}: samples of {stale} were taught with another model; re-teach them", flush=True)
             self._trust_cache = {}
