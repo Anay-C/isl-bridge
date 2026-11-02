@@ -145,7 +145,7 @@ export default function App() {
   const [turns, setTurns] = useState<Turn[]>([])
   const [lang, setLang] = useState<'en' | 'hi'>('en')
   const [scenario, setScenario] = useState('hospital')
-  const [user] = useState(initialUser)
+  const [user, setUser] = useState(initialUser)
   // first visit: welcome + how to test + "help improve" choice (keypoints only, never video). Until it is
   // answered nothing is logged.
   const [welcome, setWelcome] = useState(() => localStorageGet('isl-welcome') !== '1')
@@ -224,7 +224,13 @@ export default function App() {
       if (m.type === 'ready') {
         setVocab(m.vocab); setPersonal(m.personal)
         setServer({ metaAi: m.meta_ai !== false, version: m.version ?? '', public: !!m.public })
+        // the public server gave this device another profile id (the requested one is reserved): keep it
+        if (m.user && m.user !== user) { localStorageSet('isl-user', m.user); setUser(m.user) }
         if (!m.model && !recordMode) setStatus('Model not trained yet')
+      }
+      else if (m.type === 'deleted') {
+        setToast(`Deleted everything saved for this profile (${m.files} files). Starting fresh…`)
+        setTimeout(newProfile, 1800)
       }
       else if (m.type === 'feedback_ok') setToast(m.learned?.length ? `Thanks! Saved, and it learned your “${m.learned.map(pretty).join('”, “')}”.` : 'Thanks! Your report is saved.')
       else if (m.type === 'summary') setSummary(m)
@@ -546,6 +552,10 @@ export default function App() {
     setTurns((ts) => ts.map((t, i) => (i === fix.turn ? { ...t, reported: true } : t)))
     setFix(null)
   }
+  const deleteMyData = () => {
+    if (!confirm('Delete everything ISL Bridge saved for this profile: taught signs, sign keypoints and reports? This cannot be undone.')) return
+    if (!send({ type: 'delete_me' })) setToast('Not connected to the server - try again in a moment')
+  }
   const sendNote = () => {
     if (note.trim() && !send({ type: 'feedback', note: note.trim(), device: navigator.userAgent })) {
       setToast('Not connected to the server - try again in a moment'); return
@@ -830,7 +840,7 @@ export default function App() {
             <button className="menu-row" onClick={() => { setMenuOpen(false); setAboutOpen(true) }}>
               <span>ⓘ About, privacy &amp; credits</span>
             </button>
-            <p className="profile-row">👤 Profile <code>{user}</code> · <button className="linkish" onClick={() => { if (confirm('Start with a new, empty profile on this device? Signs you taught stay with the old one.')) newProfile() }}>start fresh</button></p>
+            <p className="profile-row">👤 Profile <code>{user}</code> · <button className="linkish" onClick={() => { if (confirm('Start with a new, empty profile on this device? Signs you taught stay with the old one.')) newProfile() }}>start fresh</button> · <button className="linkish" onClick={deleteMyData}>delete my data</button></p>
           </div>
         </div>
       )}
@@ -856,7 +866,7 @@ export default function App() {
               <span>🔬 Help improve ISL Bridge<small>Save the hand and body keypoints of my signs and my reports (numbers, never video), so the team can fix mistakes</small></span>
               <span className={`toggle ${logOk ? 'on' : ''}`} aria-hidden="true" />
             </button>
-            <p className="profile-row">👤 Profile <code>{user}</code> · <button className="linkish" onClick={() => { if (confirm('Start with a new, empty profile on this device? Signs you taught stay with the old one.')) newProfile() }}>start fresh</button>
+            <p className="profile-row">👤 Profile <code>{user}</code> · <button className="linkish" onClick={() => { if (confirm('Start with a new, empty profile on this device? Signs you taught stay with the old one.')) newProfile() }}>start fresh</button> · <button className="linkish" onClick={deleteMyData}>delete my data</button>
               {server.version && <> · build <code>{server.version}</code></>}</p>
             {credit}
             <div className="row">
