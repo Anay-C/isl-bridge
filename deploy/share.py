@@ -10,7 +10,7 @@
   https://<words>.trycloudflare.com address that lives as long as this script runs. It is printed and written to
   data/share_url.txt.
 - Watchdog: restarts the server or the tunnel if one dies or the link stops answering (a new tunnel = a new
-  link; it is printed again). Ctrl+C stops both.
+  link; it is printed again). Ctrl+C stops both; from anywhere: deploy/stop_share.bat (= share.py --stop).
 - Keep the laptop on, plugged in and online. Its power plan never sleeps on its own (checked 3 Nov 2026), but
   closing the lid usually does (Windows default), which takes the link down until this script is restarted.
 """
@@ -123,7 +123,24 @@ def announce(url):
           f"  Open it on a phone (Chrome / Safari) or a laptop with a camera. Message to send:\n"
           f"  \"Please try ISL Bridge, an Indian Sign Language conversation app: {url}\n"
           f"   Allow the camera, read the 1-minute intro, then sign and tap 'Wrong?' when it gets a sign wrong.\"\n"
-          f"  (also saved in data/share_url.txt; reports: data/feedback/)\n{bar}\n", flush=True)
+          f"  (also saved in data/share_url.txt; reports: data/feedback/, summary: ml/tester_report.py)\n"
+          f"  Stop sharing: close this window, or double-click deploy\\stop_share.bat\n{bar}\n", flush=True)
+
+
+# share.py + its server + tunnel (taskkill /T = the whole tree), then anything still on the port
+STOP_PS = r"""
+Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'deploy[\\/]share\.(py|bat)' -and $_.CommandLine -notmatch '--stop' } | ForEach-Object { taskkill /F /T /PID $_.ProcessId | Out-Null; $_.ProcessId }
+Get-NetTCPConnection -LocalPort PORT -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue; $_.OwningProcess }
+Get-CimInstance Win32_Process -Filter "Name='cloudflared.exe'" | Where-Object { $_.CommandLine -match '127\.0\.0\.1:PORT' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; $_.ProcessId }
+"""
+
+
+def stop(port):
+    """Stop a running share from anywhere (its window may be hidden). Windows only."""
+    out = subprocess.run(["powershell", "-NoProfile", "-Command", STOP_PS.replace("PORT", str(port))],
+                         capture_output=True, text=True).stdout.split()
+    URL_FILE.unlink(missing_ok=True)
+    log(f"stopped {len(out)} process(es): the public link is offline" if out else "nothing was sharing")
 
 
 def main():
@@ -131,7 +148,10 @@ def main():
     ap.add_argument("--port", type=int, default=8010)
     ap.add_argument("--device", default=os.environ.get("ISL_DEVICE", "cpu"))
     ap.add_argument("--no-build", action="store_true")
+    ap.add_argument("--stop", action="store_true", help="stop a running share (server + tunnel) and exit")
     a = ap.parse_args()
+    if a.stop:
+        return stop(a.port)
     if not CF.exists():
         sys.exit(f"missing {CF}: download cloudflared-windows-amd64.exe from "
                  "https://github.com/cloudflare/cloudflared/releases and save it there")

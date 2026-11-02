@@ -19,6 +19,8 @@ certificate warning, no app install, no account.
   Cloudflare). Keep the window open and the laptop on, plugged in and online. Closing the lid or a reboot takes the
   link down; run the script again and you get a **new** link (also written to `data/share_url.txt`).
 - A watchdog restarts the server or the tunnel by itself if one dies (a new tunnel = a new link, printed again).
+- **Stop sharing:** close the window, or double-click **`deploy\stop_share.bat`** (also works when the window is
+  hidden).
 - It runs a separate public-mode server on `127.0.0.1:8010`. Your own setup (`:8000` + Vite `:5173`) is untouched.
 - Public mode means per-device limits (40 replies/min, 8 Lens photos/min, 40 Spark calls/min per signer),
   debug routes off, and your `anay` profile can't be opened from the link.
