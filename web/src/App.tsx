@@ -1,0 +1,822 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
+import './App.css'
+import { detect, draw, loadVision, type Raw } from './vision'
+import { WavRecorder } from './wav'
+import Record from './Record'
+import Learn, { type Overlay, type PracticeResult } from './Learn'
+import Cutout from './Cutout'
+import Ghost, { ghostMs, loadGhost, type GhostRef } from './Ghost'
+
+type Cand = { label: string; p: number }
+// cands: the top-3 per sign that Muse Spark chose from; chosen: what it picked (shows context corrections)
+type Turn = { who: 'deaf' | 'hearing'; text: string; sub?: string; ms?: number; playlist?: Clip[]; cands?: Cand[][]; chosen?: string[]; typed?: boolean }
+type Clip = { sign?: string; clip?: string; cutout?: string; cutout_box?: number[]; fingerspell?: string; dictionary?: boolean; picture?: string }
+type Enroll = { label: string; n: number; reps: number } | null
+type Report = { label: string; kept: number; dropped: number; self_test: number; confused_with: string[] }
+const TEACH_REPS = 5
+// Quick setup: the words a hospital demo needs most. Teaching each 5x makes the app learn YOUR way of signing.
+const QUICK_WORDS = ['Hello', 'Thank you', 'I', 'you', 'Pain', 'Head', 'Stomach', 'Fever', 'Doctor', 'Medicine',
+  'Help', 'Water', 'Yes', 'No', 'Please', 'Today', 'Yesterday', 'Where', 'What', 'Emergency']
+type Summary = {
+  chief_complaint: string; symptoms: { symptom: string; since: string; severity: string }[]
+  medicines_mentioned: string[]; allergies: string[]; to_confirm: string[]
+  summary_english: string; summary_hindi: string; _error?: string
+}
+// HELP alone is everyday clinic talk ("can you help me?"), so it only counts together with PAIN / HURT
+const SOS_SIGNS = new Set(['Emergency', 'Ambulance', 'Police'])
+const SOS_PAIRS = [['Help', 'Pain'], ['Help', 'Hurt']]
+const SOS_TEXT = {
+  en: 'I am Deaf and I need help. Please call 112.',
+  hi: 'मैं बधिर हूँ, मुझे मदद चाहिए। कृपया 112 पर कॉल करें।',
+}
+const SCENARIO_LIST: [string, string][] = [['hospital', '🏥 Hospital'], ['pharmacy', '💊 Pharmacy'], ['general', '💬 General']]
+
+const pretty = (l: string) => l.replace(' large', '').replace(' little', '').replace('Store or Shop', 'Shop')
+
+// Text-to-speech. Phones block speech on a page that has never been tapped (Chrome Android fails with
+// "not-allowed"; iPhone needs the first speak() inside a tap), and a signer may never touch the screen.
+// So the first tap anywhere unlocks speech, and a "tap to turn on the voice" bar shows until then.
+const hasTTS = typeof window !== 'undefined' && 'speechSynthesis' in window
+let voiceUnlocked = false
+function unlockVoice() {
+  if (voiceUnlocked || !hasTTS) return
+  voiceUnlocked = true
+  const u = new SpeechSynthesisUtterance(' ')
+  u.volume = 0
+  speechSynthesis.speak(u)
+}
+function pageWasTapped() {
+  const ua = (navigator as Navigator & { userActivation?: { hasBeenActive: boolean } }).userActivation
+  return voiceUnlocked || (ua ? ua.hasBeenActive : false)
+}
+function pickVoice(lang: 'en' | 'hi') {
+  const vs = speechSynthesis.getVoices()
+  const norm = (l: string) => l.replace('_', '-').toLowerCase()
+  const want = lang === 'hi' ? 'hi' : 'en'
+  return vs.find((v) => norm(v.lang) === `${want}-in` && v.localService) ?? vs.find((v) => norm(v.lang) === `${want}-in`)
+    ?? vs.find((v) => norm(v.lang).startsWith(want) && v.default) ?? vs.find((v) => norm(v.lang).startsWith(want))
+}
+function speak(text: string, lang: 'en' | 'hi', onFail?: (error: string) => void) {
+  if (!hasTTS) { onFail?.('this browser has no text-to-speech'); return }
+  const u = new SpeechSynthesisUtterance(text)
+  u.lang = lang === 'hi' ? 'hi-IN' : 'en-IN'
+  const v = pickVoice(lang)
+  if (v) u.voice = v
+  u.onerror = (e) => { if (e.error !== 'interrupted' && e.error !== 'canceled') onFail?.(e.error) }
+  // Chrome bug: speak() right after cancel() is sometimes dropped silently, so only cancel when needed
+  const busy = speechSynthesis.speaking || speechSynthesis.pending
+  if (busy) speechSynthesis.cancel()
+  speechSynthesis.resume()  // Chrome Android can get stuck "paused" after the tab was in the background
+  if (busy) setTimeout(() => speechSynthesis.speak(u), 120)
+  else speechSynthesis.speak(u)
+}
+
+export default function App() {
+  const video = useRef<HTMLVideoElement>(null)
+  const canvas = useRef<HTMLCanvasElement>(null)
+  const ws = useRef<WebSocket | null>(null)
+  const rec = useRef<WavRecorder | null>(null)
+  const speechSock = useRef<WebSocket | null>(null)
+  const [live, setLive] = useState('')
+  const [source, setSource] = useState<'camera' | 'screen'>('camera')
+  // camera picker: every camera on the device; the choice is remembered. Back cameras are not mirrored.
+  const [cams, setCams] = useState<MediaDeviceInfo[]>([])
+  const [camId, setCamId] = useState(() => localStorageGet('isl-cam') ?? '')
+  const [activeCam, setActiveCam] = useState('')
+  const [mirror, setMirror] = useState(true)
+  const recent = useRef<string[]>([])  // last confident signs, for SOS pairs
+  const framing = useRef<Framing>({ n: 0, far: 0, near: 0, oneHand: 0, hint: '', bad: 0, block: false })
+  const [frameHint, setFrameHint] = useState('')
+  const [frameBlock, setFrameBlock] = useState(false)  // camera too close: recognition paused, outline shown
+  const canShare = typeof navigator.mediaDevices?.getDisplayMedia === 'function'
+  const signingRef = useRef(false)
+  const [status, setStatus] = useState('Starting camera…')
+  const [signing, setSigning] = useState(false)
+  const [pending, setPending] = useState<Cand[][]>([])
+  const [interim, setInterim] = useState<string[]>([])  // live guesses while signing
+  const [composing, setComposing] = useState(false)  // hands down 2 s, Muse Spark is writing the sentence
+  // voice: null = fine; otherwise speech is blocked until a tap (the text is what still needs saying)
+  const [voiceBlocked, setVoiceBlocked] = useState<{ text: string } | null>(() => (pageWasTapped() ? null : { text: '' }))
+  useEffect(() => {
+    const onTap = () => { unlockVoice(); setVoiceBlocked((b) => (b && !b.text ? null : b)) }
+    window.addEventListener('pointerdown', onTap, true)
+    return () => window.removeEventListener('pointerdown', onTap, true)
+  }, [])
+  const sayAloud = (text: string, lang: 'en' | 'hi') => speak(text, lang, (error) => {
+    send({ type: 'client_log', msg: `speech failed: ${error} | ${navigator.userAgent}` })
+    setVoiceBlocked({ text })
+  })
+  const [queue, setQueue] = useState<string[]>([])  // quick-setup words still to teach
+  const queueRef = useRef<string[]>([])
+  queueRef.current = queue
+  const startEnrollRef = useRef<(l: string) => void>(() => {})
+  const [turns, setTurns] = useState<Turn[]>([])
+  const [lang, setLang] = useState<'en' | 'hi'>('en')
+  const [scenario, setScenario] = useState('hospital')
+  const [user] = useState(() => localStorageGet('isl-user') ?? 'anay')
+  const [vocab, setVocab] = useState<string[]>([])
+  const [enroll, setEnroll] = useState<Enroll>(null)
+  const [teachOpen, setTeachOpen] = useState(false)
+  const [teachLabel, setTeachLabel] = useState('')
+  const [personal, setPersonal] = useState<Record<string, number>>({})
+  const [report, setReport] = useState<Report | null>(null)
+  const [sos, setSos] = useState<'offer' | 'alert' | null>(null)
+  const [summary, setSummary] = useState<Summary | 'loading' | null>(null)
+  const [typeOpen, setTypeOpen] = useState(false)
+  const [typed, setTyped] = useState('')
+  const [recording, setRecording] = useState(false)
+  const [playlist, setPlaylist] = useState<Clip[]>([])
+  const [clipIdx, setClipIdx] = useState(0)
+  const [caption, setCaption] = useState('')
+  // 👻 Ghost signer: replies are signed by a bright ghost figure instead of the video clips
+  const [ghostOn, setGhostOn] = useState(() => localStorageGet('isl-ghost') === '1')
+  const [ghost, setGhost] = useState<{ idx: number; sign: string; g: GhostRef | null } | null>(null)  // g null = no recording
+  const recordMode = new URLSearchParams(location.search).has('record')
+  const learnMode = new URLSearchParams(location.search).has('learn')
+  const overlay = useRef<Overlay | null>(null)
+  const [practice, setPractice] = useState<PracticeResult | null>(null)
+  const [clips, setClips] = useState<string[]>([])
+  useEffect(() => { fetch('/api/vocab').then((r) => r.json()).then((d) => setClips(d.clips)).catch(() => {}) }, [])
+  const [setupLater, setSetupLater] = useState(() => localStorageGet('isl-setup-later') === '1')
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [aboutOpen, setAboutOpen] = useState(false)
+  // the conversation scrolls inside its own panel (the camera stays put); keep the newest turn in view
+  const chatRef = useRef<HTMLElement>(null)
+  useEffect(() => {
+    const c = chatRef.current
+    if (c && (turns.length || live)) c.scrollTo({ top: c.scrollHeight, behavior: 'smooth' })
+  }, [turns.length, live])
+  const langRef = useRef(lang)
+  langRef.current = lang
+
+  const send = (m: object) => ws.current?.readyState === 1 && ws.current.send(JSON.stringify(m))
+  const scenarioRef = useRef(scenario)
+  scenarioRef.current = scenario
+  // scenario change: tell the open connection (reconnecting would drop the conversation history)
+  useEffect(() => { send({ type: 'scenario', scenario }) }, [scenario])
+
+  // ---- WebSocket (reconnects by itself, e.g. if the server restarts during a demo) -------------
+  useEffect(() => {
+    let closed = false
+    let retry: ReturnType<typeof setTimeout> | undefined
+    const connect = () => {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+    const sock = new WebSocket(`${proto}://${location.host}/ws/sign`)
+    ws.current = sock
+    sock.onopen = () => {
+      sock.send(JSON.stringify({ type: 'hello', user, scenario: scenarioRef.current, mode: learnMode ? 'learn' : 'talk' }))
+      setPending([])
+      setEnroll(null)
+      setStatus((st) => (st === 'Disconnected from server' || st.startsWith('Reconnecting') ? 'Ready — sign to the camera' : st))
+    }
+    sock.onmessage = (ev) => {
+      const m = JSON.parse(ev.data)
+      if (m.type === 'ready') { setVocab(m.vocab); setPersonal(m.personal); if (!m.model && !recordMode) setStatus('Model not trained yet') }
+      else if (m.type === 'summary') setSummary(m)
+      else if (m.type === 'practice_result') setPractice(m)
+      else if (m.type === 'personal') { setPersonal(m.personal); setVocab(m.vocab) }
+      else if (m.type === 'enroll_done') {
+        setPersonal((p) => ({ ...p, [m.label]: m.kept }))
+        const q = queueRef.current
+        if (q.length && m.self_test >= m.kept - 1) {  // quick setup: learned well, go straight to the next word
+          setStatus(`Learned “${m.label}” ✓ — next: “${q[0]}”`)
+          setQueue(q.slice(1))
+          setTimeout(() => startEnrollRef.current(q[0]), 1200)
+        } else setReport(m)
+      }
+      else if (m.type === 'interim') { if (signingRef.current) setInterim(m.signs) }
+      else if (m.type === 'composing') setComposing(true)
+      else if (m.type === 'state') { setSigning(m.signing); signingRef.current = m.signing; if (!m.signing) setInterim([]); else setComposing(false) }
+      else if (m.type === 'sign' && learnMode) { /* Learn page only reacts to practice results */ }
+      else if (m.type === 'sign') {
+        setInterim([])
+        setPending((p) => [...p, m.top])
+        const sure = m.top[0].p > 0.5 ? m.top[0].label : null
+        recent.current = [...recent.current, ...(sure ? [sure] : [])].slice(-4)
+        if (sure && (SOS_SIGNS.has(sure) || SOS_PAIRS.some(([a, b]) => recent.current.includes(a) && recent.current.includes(b))))
+          setSos((s) => s ?? 'offer')
+      }
+      else if (m.type === 'sentence') {
+        setComposing(false)
+        setPending((p) => p.slice(m.n ?? p.length))  // signs made while Spark was writing stay pending
+        const text = langRef.current === 'hi' && m.hindi ? m.hindi : m.english
+        setTurns((t) => [...t, { who: 'deaf', text, sub: m.chosen_signs.map(pretty).join(' · '), ms: m._latency_ms, cands: m.cands, chosen: m.chosen_signs }])
+        sayAloud(text, langRef.current)
+      } else if (m.type === 'enroll_progress') {
+        setEnroll(m.n >= m.reps ? null : m)
+        if (m.n >= m.reps) { setVocab((v) => (v.includes(m.label) ? v : [...v, m.label])); setStatus(`Learned “${m.label}” ✓`) }
+      } else if (m.type === 'error') setStatus(m.message)
+    }
+    sock.onclose = () => {
+      if (closed) return
+      setStatus('Reconnecting to server…')
+      setComposing(false)
+      setSigning(false); signingRef.current = false
+      retry = setTimeout(connect, 2000)
+    }
+    }
+    connect()
+    return () => { closed = true; clearTimeout(retry); ws.current?.close() }
+  }, [user])
+
+  // ---- Camera + MediaPipe loop ---------------------------------------------------------------
+  // source 'screen' = a shared tab/window (e.g. an ISL video playing on YouTube) through the same live pipeline
+  useEffect(() => {
+    let stop = false
+    let stream: MediaStream | null = null
+    ;(async () => {
+      stream = source === 'screen'
+        ? await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30 } }, audio: false })
+        : await navigator.mediaDevices.getUserMedia({
+          video: { ...(camId ? { deviceId: { exact: camId } } : { facingMode: 'user' }), width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: false,
+        }).catch((e) => {
+          if (!camId) throw e
+          setCamId(''); localStorageSet('isl-cam', null)  // saved camera is gone (unplugged, other phone)
+          throw new Error('saved camera not found, switching to the default one')
+        })
+      if (stop) { stream.getTracks().forEach((t) => t.stop()); return }
+      const track = stream.getVideoTracks()[0]
+      if (source === 'camera') {
+        const st = track.getSettings()
+        setActiveCam(st.deviceId ?? '')
+        setMirror(st.facingMode !== 'environment')  // selfie view for front / laptop cameras only
+        // labels are only filled in after camera permission, so list the cameras now
+        navigator.mediaDevices.enumerateDevices().then((d) => setCams(d.filter((x) => x.kind === 'videoinput'))).catch(() => {})
+      }
+      track.onended = () => setSource('camera')  // user pressed "Stop sharing"
+      const v = video.current!
+      v.srcObject = stream
+      await v.play()
+      setStatus('Loading hand tracking…')
+      await loadVision()
+      setStatus(source === 'screen' ? 'Watching the shared screen…' : 'Ready — sign to the camera')
+      let lastTime = -1
+      const loop = () => {
+        if (stop) return
+        // only new camera frames: phones redraw at 60-120 Hz but the camera gives ~30 fps; re-running the
+        // models on the same frame wastes the phone's compute (worse tracking) and skews the frame rate
+        const fresh = v.currentTime !== lastTime
+        lastTime = v.currentTime
+        const r = fresh ? detect(v) : null
+        if (r) framing.current = checkFraming(r.raw, v, framing.current, setFrameHint, setFrameBlock, source === 'camera')
+        if (r) {
+          // too close to read the signs: send "nobody there" so no guesses are made from fragments of a sign
+          send(framing.current.block ? { type: 'frame', w: r.frame.w, h: r.frame.h, t: r.frame.t, pose: null, lh: null, rh: null } : { type: 'frame', ...r.frame })
+          const c = canvas.current!
+          if (c.width !== v.videoWidth) { c.width = v.videoWidth; c.height = v.videoHeight }
+          const ctx = c.getContext('2d')!
+          draw(ctx, r.raw, signingRef.current)
+          overlay.current?.(ctx, r.raw)
+        }
+        requestAnimationFrame(loop)
+      }
+      loop()
+    })().catch((e) => { setStatus(`${source === 'screen' ? 'Screen share' : 'Camera'} error: ${e.message}`); if (source === 'screen') setSource('camera') })
+    return () => { stop = true; stream?.getTracks().forEach((t) => t.stop()) }
+  }, [source, camId])
+
+  // ---- Hearing person: hold to talk -> clips --------------------------------------------------
+  // Realtime: mic PCM streams to /ws/speech while held (live captions); falls back to uploading the WAV.
+  const startTalk = async () => {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+    const sock = new WebSocket(`${proto}://${location.host}/ws/speech`)
+    sock.binaryType = 'arraybuffer'
+    const queue: ArrayBuffer[] = []
+    sock.onopen = () => { sock.send(JSON.stringify({ type: 'start', scenario })); queue.splice(0).forEach((b) => sock.send(b)) }
+    let sentEnd = false, done = false
+    sock.onmessage = (ev) => {
+      const m = JSON.parse(ev.data)
+      if (m.type === 'partial') setLive(m.text)
+      else if (m.type === 'result') { done = true; setLive(''); showReply(m); sock.close() }
+      else if (m.type === 'error') {
+        if (speechSock.current === sock) speechSock.current = null  // still talking: upload the WAV on release
+        if (sentEnd) { done = true; setLive(''); setStatus(m.message === 'no speech heard' ? 'No speech heard — hold the mic and speak' : `Speech error: ${m.message}`) }
+        sock.close()
+      }
+    }
+    sock.onerror = () => { if (speechSock.current === sock) speechSock.current = null }
+    sock.onclose = () => { if (sentEnd && !done) { setLive(''); setStatus('Speech translation failed — try again or type ⌨️') } }
+    ;(sock as WebSocket & { markEnd?: () => void }).markEnd = () => { sentEnd = true }
+    speechSock.current = sock
+    const r = new WavRecorder((pcm) => {
+      if (sock.readyState === WebSocket.OPEN) sock.send(pcm)
+      else if (sock.readyState === WebSocket.CONNECTING) queue.push(pcm)
+    })
+    rec.current = r
+    talkStart.current = r.start().catch((e) => {
+      rec.current = null; sock.close(); speechSock.current = null
+      setStatus(`Microphone error: ${(e as Error).message}`)
+      throw e
+    })
+    setRecording(true)
+  }
+  const talkStart = useRef<Promise<void> | null>(null)
+  const stopTalk = async () => {
+    if (!rec.current) return
+    setRecording(false)
+    try { await talkStart.current } catch { return }  // released before the mic finished starting
+    if (!rec.current) return
+    const wav = await rec.current.stop()
+    rec.current = null
+    const sock = speechSock.current
+    speechSock.current = null
+    if (sock && sock.readyState === WebSocket.OPEN) {
+      setStatus('Translating to ISL…')
+      ;(sock as WebSocket & { markEnd?: () => void }).markEnd?.()
+      sock.send(JSON.stringify({ type: 'end' }))
+      return
+    }
+    setLive('')
+    if (wav.size <= 44 + 16000) { setStatus('Hold the mic button while you speak'); return }  // < 0.5 s of audio
+    const fd = new FormData()  // realtime unavailable: upload the recording instead
+    fd.append('audio', wav, 'speech.wav')
+    fd.append('scenario', scenario)
+    await toSign(fetch('/api/speech', { method: 'POST', body: fd }))
+  }
+
+  // hearing person's reply (spoken or typed) -> captions + ISL clips
+  const showReply = (j: { caption: string; playlist: Clip[]; latency_ms: { total: number } }, typed = false) => {
+    setTurns((t) => [...t, { who: 'hearing', text: j.caption, sub: j.playlist.map((c: Clip) => c.sign ? pretty(c.sign) : `“${c.fingerspell}”`).join(' · '), ms: j.latency_ms.total, playlist: j.playlist, typed }])
+    send({ type: 'reply', text: j.caption })
+    setCaption(j.caption)
+    setPlaylist(j.playlist)
+    setClipIdx(0)
+    setStatus('Ready — sign to the camera')
+  }
+  const toSign = async (req: Promise<Response>, typed = false) => {
+    setStatus('Translating to ISL…')
+    try {
+      const r = await req
+      if (!r.ok) {
+        const t = await r.text()
+        let msg = t
+        try { msg = JSON.parse(t).error ?? t } catch { /* plain text */ }
+        throw new Error(msg)
+      }
+      showReply(await r.json(), typed)
+    } catch (e) {
+      setStatus(`Translation error: ${(e as Error).message.slice(0, 120)}`)
+    }
+  }
+  const sendTyped = () => {
+    const text = typed.trim()
+    if (!text) return
+    setTyped('')
+    setTypeOpen(false)
+    toSign(fetch('/api/text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, scenario }) }), true)
+  }
+
+  const captureFrame = () => {  // unmirrored camera frame for ISL Lens
+    const v = video.current
+    if (!v || !v.videoWidth) return null
+    const c = document.createElement('canvas')
+    c.width = v.videoWidth
+    c.height = v.videoHeight
+    c.getContext('2d')!.drawImage(v, 0, 0)
+    return c.toDataURL('image/jpeg', 0.8)
+  }
+
+  const nextClip = useCallback(() => setClipIdx((i) => i + 1), [])
+  const current = playlist[clipIdx]
+  useEffect(() => {
+    if (current && !current.clip) { const t = setTimeout(nextClip, 1400); return () => clearTimeout(t) }
+  }, [current, nextClip])
+  // ghost signer: preload every sign of the reply, then play each one; signs without a reference recording
+  // (e.g. ISLRTC dictionary words) fall back to their video clip
+  // warm the HTTP cache with every clip / picture of the reply, so each sign starts without a blank gap
+  useEffect(() => {
+    for (const c of playlist) for (const u of [c.cutout ?? c.clip, c.picture]) if (u) fetch(u).catch(() => {})
+  }, [playlist])
+  const ghostable = (c?: Clip) => !!(ghostOn && c?.sign && !c.dictionary && clips.includes(c.sign))
+  useEffect(() => { if (ghostOn) playlist.forEach((c) => ghostable(c) && loadGhost(c.sign!)) }, [playlist, ghostOn])
+  useEffect(() => {
+    if (!ghostable(current)) return
+    let cancel = false, t: ReturnType<typeof setTimeout> | undefined
+    loadGhost(current!.sign!).then((g) => {
+      if (cancel) return
+      setGhost({ idx: clipIdx, sign: current!.sign!, g })
+      if (g) t = setTimeout(nextClip, ghostMs(g))
+    })
+    return () => { cancel = true; clearTimeout(t) }
+  }, [current, clipIdx, ghostOn])
+  // decided from the current sign directly (not after an effect), so the video never flashes between signs
+  const loaded = ghost && ghost.idx === clipIdx && ghost.sign === current?.sign ? ghost : undefined
+  const ghostNow = ghostable(current) && loaded?.g !== null ? { g: loaded?.g ?? null } : null
+
+  const startEnroll = (label: string) => {
+    if (!label.trim()) return
+    send({ type: 'enroll', label: label.trim(), reps: TEACH_REPS, restart: true })
+    setPending([])  // the server drops unspoken signs when teaching starts
+    setReport(null)
+    setTeachOpen(false)
+    setTeachLabel('')
+  }
+
+  startEnrollRef.current = startEnroll
+  const quickWords = QUICK_WORDS.filter((w) => vocab.includes(w))
+  const quickSetup = () => {
+    if (!quickWords.length) return
+    setQueue(quickWords.slice(1))
+    startEnroll(quickWords[0])
+  }
+
+  const shareLocation = () => {
+    const open = (extra: string) => window.open(`https://wa.me/?text=${encodeURIComponent(SOS_TEXT.en + ' ' + SOS_TEXT.hi + extra)}`, '_blank')
+    if (!navigator.geolocation) return open('')
+    navigator.geolocation.getCurrentPosition(
+      (p) => open(` My location: https://maps.google.com/?q=${p.coords.latitude},${p.coords.longitude}`),
+      () => open(''), { timeout: 5000 })
+  }
+
+  const toggleGhost = () => { const v = !ghostOn; setGhostOn(v); localStorageSet('isl-ghost', v ? '1' : '0') }
+  const talkMode = !learnMode && !recordMode
+  const stopPlayback = () => { setPlaylist([]); setClipIdx(0) }
+  const credit = (
+    <p className="credit">Sign videos: ISL Dictionary, Indian Sign Language Research and Training Centre (ISLRTC), DEPwD, Ministry of Social Justice &amp; Empowerment · INCLUDE dataset (AI4Bharat), signers of St. Louis School for the Deaf, Adyar · CISLR (IIT Kanpur) · ISL-CSLTR (Elakkiya &amp; Natarajan) · Powered by Meta Muse Spark, Voice Transcribe &amp; SAM 3.1 · <button className="linkish" onClick={() => setAboutOpen(true)}>About &amp; privacy</button></p>
+  )
+
+  return (
+    <div className={`app ${talkMode ? 'mode-talk' : 'mode-panel'}`}>
+      <header className="top">
+        <a className="brand" href="?" aria-label="ISL Bridge"><span className="logo" aria-hidden="true">🤟</span>ISL<span>Bridge</span></a>
+        <div className="top-actions">
+          <select className="wide-only" aria-label="Scenario" value={scenario} onChange={(e) => setScenario(e.target.value)}>
+            {SCENARIO_LIST.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+          </select>
+          <button className="pill" aria-label="Language of the spoken sentences" title="Spoken language" onClick={() => setLang(lang === 'en' ? 'hi' : 'en')}>{lang === 'en' ? 'EN' : 'हिं'}</button>
+          {canShare && <button className={`pill wide-only ${source === 'screen' ? 'on' : ''}`} title="Test on a video: share a tab playing ISL (e.g. YouTube)"
+            onClick={() => setSource(source === 'screen' ? 'camera' : 'screen')}>{source === 'screen' ? '📷 Camera' : '📺 Video'}</button>}
+          {!learnMode && <button className={`pill wide-only ${ghostOn ? 'on' : ''}`} title="Ghost signer: replies are signed by a ghost figure instead of videos" onClick={toggleGhost}>👻</button>}
+          <a className="pill wide-only" href={learnMode ? '?' : '?learn'}>{learnMode ? '💬 Talk' : '🎓 Learn'}</a>
+          <button className="pill wide-only" aria-label="About and privacy" onClick={() => setAboutOpen(true)}>ⓘ</button>
+          <button className="pill narrow-only" aria-label="Menu" onClick={() => setMenuOpen(true)}>☰</button>
+          <button className="pill sos-pill" onClick={() => setSos('offer')}>SOS</button>
+        </div>
+      </header>
+
+      <section className={`stage ${signing ? 'live' : ''} ${source === 'camera' && cams.length > 1 ? 'has-cams' : ''}`}>
+        <video ref={video} playsInline muted className={source === 'camera' ? (mirror ? 'mirror' : '') : 'contain'} />
+        <canvas ref={canvas} className={`${source === 'camera' ? (mirror ? 'mirror' : '') : 'contain'} overlay`} />
+        {source === 'camera' && cams.length > 1 && !current && (
+          <select className="cam-select" aria-label="Choose camera" value={activeCam}
+            onChange={(e) => { setCamId(e.target.value); localStorageSet('isl-cam', e.target.value) }}>
+            {cams.map((c, i) => <option key={c.deviceId || i} value={c.deviceId}>📷 {camName(c, i)}</option>)}
+          </select>
+        )}
+        {frameHint && !current && !frameBlock && <div className="frame-hint" role="status">{frameHint}</div>}
+        {frameBlock && !current && (
+          <div className="frame-gate" role="alert">
+            <svg className="silhouette" viewBox="0 0 120 160" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+              <ellipse cx="60" cy="38" rx="13" ry="16" />
+              <path d="M32 74 Q60 60 88 74 L96 112 M32 74 L24 112 M40 160 L42 96 M80 160 L78 96" />
+              <path d="M24 112 Q22 92 34 84 M96 112 Q98 92 86 84" />
+            </svg>
+            <div className="gate-text">
+              <b>📏 Move the phone back</b>
+              <span>Your head, shoulders and both hands must fit in the picture, like the outline. Signs are not read until then.</span>
+            </div>
+          </div>
+        )}
+        {!current && <div className="status">{enroll ? `Teaching “${enroll.label}” — sign it (${enroll.n}/${enroll.reps})` : signing ? (learnMode ? '● Signing…' : '● Signing… lower your hands when you finish') : composing && !learnMode ? '✍️ Writing the sentence…' : status}</div>}
+        {!current && !signing && !enroll && talkMode && source === 'camera' && <div className="privacy" title="Hand and body keypoints are computed on this device; only those numbers are sent">🔒 Video stays on this device</div>}
+        {enroll && <div className="enroll-bar"><div style={{ width: `${(enroll.n / enroll.reps) * 100}%` }} /></div>}
+        {enroll && clips.includes(enroll.label) && (
+          <video className="teach-ref" key={enroll.label} src={`/clips/${encodeURIComponent(enroll.label)}.mp4`} autoPlay loop muted playsInline />
+        )}
+        {enroll && !recordMode && (
+          <div className="teach-actions">
+            {queue.length > 0 && <small>{queue.length} more after this</small>}
+            <button className="ghost" onClick={() => { send({ type: 'cancel_enroll' }); setEnroll(null); setQueue([]) }}>Stop</button>
+          </div>
+        )}
+        {interim.length > 0 && !enroll && !learnMode && !current && <div className="interim">{interim.map(pretty).join(' · ')}…</div>}
+        {current && ghostNow && <Ghost key={clipIdx} g={ghostNow.g} label={pretty(current.sign ?? '')} caption={caption} />}
+        {current && !ghostNow && (
+          <div className={`ar ${current.cutout ? 'cut' : 'card'}`}>
+            {current.cutout
+              ? <Cutout key={clipIdx} src={current.cutout} box={current.cutout_box} onEnded={nextClip} />
+              : current.clip
+                ? <video key={clipIdx} className="ar-clip" src={current.clip} autoPlay muted playsInline onEnded={nextClip} />
+                : <div key={clipIdx} className="ar-spell">{current.fingerspell}</div>}
+            <div className="ar-label">{current.sign ? pretty(current.sign) : 'Fingerspelling'}{current.dictionary && <small>ISLRTC dictionary</small>}</div>
+            {current.picture && <PictureCard key={current.picture} src={current.picture} />}
+            <div className="ar-caption">{caption}</div>
+          </div>
+        )}
+        {current && (
+          <div className="ar-top">
+            <div className="ar-dots" aria-label={`sign ${clipIdx + 1} of ${playlist.length}`}>
+              {playlist.map((_, i) => <i key={i} className={i < clipIdx ? 'done' : i === clipIdx ? 'now' : ''} />)}
+            </div>
+            <button className="ar-stop" onClick={stopPlayback} aria-label="Stop signing">✕</button>
+          </div>
+        )}
+      </section>
+
+      <div className="side">
+        {voiceBlocked && talkMode && (
+          <button className="voice-bar" onClick={() => {
+            unlockVoice()
+            const text = voiceBlocked.text || (lang === 'hi' ? 'आवाज़ चालू है' : 'Voice is on')
+            setVoiceBlocked(null)
+            sayAloud(text, lang)
+          }}>🔊 {voiceBlocked.text ? 'Tap to hear the sentence (the phone blocked the voice)' : 'Tap once to turn on the voice'}</button>
+        )}
+        {recordMode && <Record user={user} enroll={enroll} send={send} />}
+        {learnMode && clips.length > 0 && <Learn clips={clips} result={practice} send={send} overlay={overlay} pretty={pretty} capture={captureFrame} />}
+
+        {talkMode && pending.length > 0 && (
+          <section className="pending" aria-label="Signs read so far">
+            {pending.map((c, i) => (
+              <div key={i} className="cand">
+                <b>{pretty(c[0].label)}</b>
+                <small>{c.slice(1).map((x) => (
+                  <button key={x.label} className="alt" title="Tap if this is what you meant (the app learns it, privately)"
+                    onClick={() => { send({ type: 'correct', index: i, label: x.label }); setPending((p) => p.map((q, j) => (j === i ? [{ label: x.label, p: 1 }] : q))) }}
+                  >{pretty(x.label)}</button>
+                ))}</small>
+              </div>
+            ))}
+            <button className="ghost" aria-label="Remove the last sign" onClick={() => { send({ type: 'undo' }); setPending((p) => p.slice(0, -1)) }}>⌫</button>
+            <button className="ghost" onClick={() => send({ type: 'speak_now' })}>Speak ▶</button>
+          </section>
+        )}
+
+        {talkMode && (
+          <section className="chat" ref={chatRef} aria-live="polite">
+            {!setupLater && Object.keys(personal).length < 5 && quickWords.length > 0 && turns.length < 2 && !enroll && (
+              <div className="setup-card">
+                <b>✋ Teach ISL Bridge your signing first</b>
+                <span>Everyone signs a little differently, and a new phone only knows other people's way. Sign the {quickWords.length} key
+                  hospital words 5 times each (about 8 minutes) and it will read <i>your</i> signs. Stays private in your profile.</span>
+                <div className="row">
+                  <button className="primary" onClick={quickSetup}>⚡ Start quick setup</button>
+                  <button className="ghost" onClick={() => { setSetupLater(true); localStorageSet('isl-setup-later', '1') }}>Later</button>
+                </div>
+              </div>
+            )}
+            {turns.length === 0 && !live && (
+              <div className="onboard">
+                <div><b>1</b><span>🤟 <strong>Sign</strong> to the camera, then lower your hands. The phone speaks your sentence.</span></div>
+                <div><b>2</b><span>🎤 The hearing person <strong>holds the mic</strong> and talks. Their words come back as ISL signs.</span></div>
+                <div><b>3</b><span>✋ <strong>Teach</strong> the app your own way of signing in 5 repetitions.</span></div>
+              </div>
+            )}
+            {turns.map((t, i) => (
+              <div key={i} className={`bubble ${t.who}`} title={t.who === 'hearing' ? 'Tap to sign it again' : 'Tap to speak it again'}
+                onClick={() => { if (t.who === 'deaf') sayAloud(t.text, lang); else if (t.playlist?.length) { setCaption(t.text); setPlaylist(t.playlist); setClipIdx(0) } }}>
+                <div className="who">{t.who === 'deaf' ? '🤟 Signed' : t.typed ? '⌨️ Typed' : '🎤 Said'}</div>
+                <div className="text">{t.text}</div>
+                {t.who === 'deaf' && t.cands?.length
+                  ? <SignTrail cands={t.cands} chosen={t.chosen ?? []} />
+                  : t.who === 'hearing' && t.playlist?.length
+                    ? <div className="trail">{t.playlist.map((c, j) => <span key={j} className={`tchip ${c.dictionary ? 'dict' : ''} ${c.sign ? '' : 'spell'}`}>{c.sign ? pretty(c.sign) : c.fingerspell}</span>)}</div>
+                    : t.sub && <small>{t.sub}</small>}
+                {t.ms ? <small className="ms">{t.who === 'deaf' ? 'Muse Spark' : 'to ISL'} · {(t.ms / 1000).toFixed(1)} s{t.who === 'hearing' && t.playlist?.length ? ' · tap to replay ▶' : ''}</small> : null}
+              </div>
+            ))}
+            {live && <div className="bubble hearing live"><div className="who">🎤 Listening…</div><div className="text">{live}</div></div>}
+            {credit}
+          </section>
+        )}
+        {!talkMode && credit}
+
+        {talkMode && (
+          <footer className="controls">
+            <button className="ctl" onClick={() => setTeachOpen(true)}><span aria-hidden="true">✋</span><small>Teach</small></button>
+            <button
+              className={`mic ${recording ? 'rec' : ''}`}
+              onPointerDown={startTalk} onPointerUp={stopTalk} onPointerLeave={() => recording && stopTalk()}
+              onContextMenu={(e) => e.preventDefault()}
+            >{recording ? 'Listening… release to send' : '🎤 Hold to speak'}</button>
+            <button className="ctl" aria-label="Type a reply" onClick={() => setTypeOpen(true)}><span aria-hidden="true">⌨️</span><small>Type</small></button>
+            <button className="ctl" disabled={turns.length < 2} onClick={() => { setSummary('loading'); send({ type: 'summary' }) }}><span aria-hidden="true">📋</span><small>Summary</small></button>
+          </footer>
+        )}
+      </div>
+
+      {typeOpen && (
+        <div className="sheet" onClick={() => setTypeOpen(false)}>
+          <div className="sheet-body" onClick={(e) => e.stopPropagation()}>
+            <h3>Type your reply</h3>
+            <p>English or Hindi. It is shown to the Deaf person in ISL signs (app signs + the ISLRTC dictionary).</p>
+            <input autoFocus placeholder="e.g. You need an X-ray before the operation" value={typed}
+              onChange={(e) => setTyped(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && sendTyped()} />
+            <button onClick={sendTyped}>Show in ISL</button>
+          </div>
+        </div>
+      )}
+      {menuOpen && (
+        <div className="sheet" onClick={() => setMenuOpen(false)}>
+          <div className="sheet-body menu" onClick={(e) => e.stopPropagation()}>
+            <h3>Settings</h3>
+            <h4>Where are you?</h4>
+            <div className="seg">
+              {SCENARIO_LIST.map(([v, l]) => <button key={v} className={scenario === v ? 'on' : ''} onClick={() => setScenario(v)}>{l}</button>)}
+            </div>
+            {!learnMode && (
+              <button className="menu-row" onClick={toggleGhost}>
+                <span>👻 Ghost signer<small>Replies are signed by a bright skeleton figure instead of videos</small></span>
+                <span className={`toggle ${ghostOn ? 'on' : ''}`} aria-hidden="true" />
+              </button>
+            )}
+            {canShare && (
+              <button className="menu-row" onClick={() => { setSource(source === 'screen' ? 'camera' : 'screen'); setMenuOpen(false) }}>
+                <span>{source === 'screen' ? '📷 Back to the camera' : '📺 Test on a video'}<small>Share a browser tab that plays ISL, e.g. YouTube</small></span>
+              </button>
+            )}
+            <a className="menu-row" href={learnMode ? '?' : '?learn'}>
+              <span>{learnMode ? '💬 Back to the conversation' : '🎓 Learn ISL'}<small>{learnMode ? '' : 'Ghost Coach: copy the signer, get stars and tips'}</small></span>
+            </a>
+            <button className="menu-row" onClick={() => { setMenuOpen(false); setAboutOpen(true) }}>
+              <span>ⓘ About, privacy &amp; credits</span>
+            </button>
+          </div>
+        </div>
+      )}
+      {aboutOpen && (
+        <div className="sheet" onClick={() => setAboutOpen(false)}>
+          <div className="sheet-body about" onClick={(e) => e.stopPropagation()}>
+            <h3>🤟 ISL Bridge</h3>
+            <p>A two-way conversation between a Deaf person who signs Indian Sign Language and a hearing person, on one phone.</p>
+            <ul>
+              <li>🔒 <b>Your signing video never leaves this device.</b> Hand and body keypoints are computed on the phone; only those numbers go to the server.</li>
+              <li>✋ Signs you teach are stored only in your profile and are never used to train the shared model.</li>
+              <li>⚠️ Machine translation can be wrong. For anything important, confirm with the Deaf person; the visit summary lists what to double-check.</li>
+            </ul>
+            <h4>Powered by Meta AI</h4>
+            <ul>
+              <li><b>Muse Spark</b>: turns the recogniser's top-3 guesses + the conversation into a natural English / Hindi sentence; rewrites speech into ISL sign order (with a dictionary search tool); visit summary; ISL Lens (vision); how-to steps for each sign.</li>
+              <li><b>Muse Voice Transcribe</b>: the hearing person's speech, live (English, Hindi, mixed).</li>
+              <li><b>SAM 3.1</b>: cuts the human signer out of each sign video so they appear in your camera view.</li>
+              <li><b>PyTorch</b>: the sign recogniser (keypoint Transformer + personal prototypes).</li>
+            </ul>
+            {credit}
+            <button onClick={() => setAboutOpen(false)}>Close</button>
+          </div>
+        </div>
+      )}
+
+      {teachOpen && (
+        <div className="sheet" onClick={() => setTeachOpen(false)}>
+          <div className="sheet-body" onClick={(e) => e.stopPropagation()}>
+            <h3>Teach the app your sign</h3>
+            <p>Sign it {TEACH_REPS} times, lowering your hands (or holding still) after each one. Works for your own way of signing a word, or brand-new signs like your name or your medicine.</p>
+            {quickWords.length > 0 && <button onClick={() => { setTeachOpen(false); quickSetup() }}>⚡ Quick setup: teach the {quickWords.length} key hospital words</button>}
+            <p className="private">🔒 Saved only to your profile. It is never used to train the shared model.</p>
+            {Object.keys(personal).length > 0 && (
+              <div className="my-signs">
+                <h4>My signs</h4>
+                {Object.entries(personal).map(([l, n]) => (
+                  <span key={l} className="my-sign">{pretty(l)} <small>{n}×</small>
+                    <button className="ghost" title="Re-teach" onClick={() => startEnroll(l)}>↻</button>
+                    <button className="ghost" title="Delete" onClick={() => send({ type: 'forget', label: l })}>✕</button>
+                  </span>
+                ))}
+              </div>
+            )}
+            <input placeholder="New sign, e.g. Insulin, Priya" value={teachLabel} onChange={(e) => setTeachLabel(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && startEnroll(teachLabel)} />
+            <button onClick={() => startEnroll(teachLabel)}>Start</button>
+            <div className="chips">{vocab.map((v) => <button key={v} onClick={() => startEnroll(v)}>{pretty(v)}</button>)}</div>
+          </div>
+        </div>
+      )}
+      {report && (
+        <div className="sheet" onClick={() => setReport(null)}>
+          <div className="sheet-body" onClick={(e) => e.stopPropagation()}>
+            <h3>{report.self_test >= report.kept - 1 ? '✓' : '⚠'} Learned “{pretty(report.label)}”</h3>
+            <p>Self-test: <b>{report.self_test}/{report.kept}</b> of your reps recognised correctly
+              {report.dropped > 0 && <> · {report.dropped} shaky {report.dropped === 1 ? 'rep' : 'reps'} left out</>}.</p>
+            {report.confused_with.length > 0 && (
+              <p>Sometimes looks like <b>{report.confused_with.map(pretty).join(', ')}</b>. Try signing it more distinctly, or re-teach.</p>
+            )}
+            {queue.length > 0
+              ? <button onClick={() => { setReport(null); startEnroll(queue[0]); setQueue(queue.slice(1)) }}>Next: {pretty(queue[0])} →</button>
+              : <button onClick={() => setReport(null)}>Done</button>}
+            <button className="secondary" onClick={() => startEnroll(report.label)}>Re-teach</button>
+          </div>
+        </div>
+      )}
+      {summary && (
+        <div className="sheet" onClick={() => setSummary(null)}>
+          <div className="sheet-body summary" onClick={(e) => e.stopPropagation()}>
+            <h3>Visit summary for the doctor</h3>
+            {summary === 'loading' ? <p>Writing summary…</p> : (<>
+              {summary.chief_complaint && <p><b>Main problem:</b> {summary.chief_complaint}</p>}
+              {summary.symptoms.length > 0 && (
+                <table><thead><tr><th>Symptom</th><th>Since</th><th>Severity</th></tr></thead>
+                  <tbody>{summary.symptoms.map((x, i) => <tr key={i}><td>{x.symptom}</td><td>{x.since || '—'}</td><td>{x.severity || '—'}</td></tr>)}</tbody></table>
+              )}
+              {summary.medicines_mentioned.length > 0 && <p><b>Medicines:</b> {summary.medicines_mentioned.join(', ')}</p>}
+              {summary.allergies.length > 0 && <p><b>Allergies:</b> {summary.allergies.join(', ')}</p>}
+              <p className="pre">{lang === 'hi' && summary.summary_hindi ? summary.summary_hindi : summary.summary_english}</p>
+              {summary.to_confirm.length > 0 && <p className="warn">Please confirm with the patient: {summary.to_confirm.join('; ')}</p>}
+              <p className="fine">Auto-generated from a sign-language translation. Check with the patient before acting on it.</p>
+              <button onClick={() => window.print()}>🖨 Print / save PDF</button>
+            </>)}
+          </div>
+        </div>
+      )}
+      {sos === 'offer' && (
+        <div className="sos-offer">
+          <b>Need emergency help?</b>
+          <button className="danger" onClick={() => { setSos('alert'); sayAloud(SOS_TEXT[lang], lang) }}>Show alert</button>
+          <button className="danger" onClick={shareLocation}>Send location (WhatsApp)</button>
+          <button className="ghost" aria-label="Close" onClick={() => setSos(null)}>✕</button>
+        </div>
+      )}
+      {sos === 'alert' && (
+        <div className="sos-alert" onClick={() => setSos(null)}>
+          <div>{SOS_TEXT.en}</div>
+          <div>{SOS_TEXT.hi}</div>
+          <button onClick={(e) => { e.stopPropagation(); shareLocation() }}>📍 Send my location</button>
+          <small>Tap anywhere to close</small>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Muse Image picture card for a word the Deaf person may not know as a sign (X-ray, inhaler...). New concepts are
+// drawn on the server in the background (~8 s), so retry quietly until the picture exists.
+function PictureCard({ src }: { src: string }) {
+  const [n, setN] = useState(0)
+  const [ok, setOk] = useState(false)
+  if (n > 14) return null
+  return <img key={n} className={`ar-pic ${ok ? 'on' : ''}`} src={n ? `${src}?r=${n}` : src} alt=""
+    onLoad={() => setOk(true)} onError={() => { setTimeout(() => setN((x) => x + 1), 1500) }} />
+}
+
+// Which sign Muse Spark picked for each recognised sign; "✨" marks a sign it changed from the recogniser's
+// top-1 to one of its alternatives because the conversation made that one more plausible.
+function SignTrail({ cands, chosen }: { cands: Cand[][]; chosen: string[] }) {
+  const aligned = chosen.length === cands.length
+  if (!aligned) return <div className="trail">{chosen.map((c, i) => <span key={i} className="tchip">{pretty(c)}</span>)}</div>
+  return (
+    <div className="trail">
+      {cands.map((c, i) => {
+        const top = c[0]?.label ?? ''
+        const fixed = chosen[i] !== top && c.some((x) => x.label === chosen[i])
+        return (
+          <span key={i} className={`tchip ${fixed ? 'fixed' : ''}`} title={c.map((x) => `${pretty(x.label)} ${Math.round(x.p * 100)}%`).join(' · ')}>
+            {fixed && <s>{pretty(top)}</s>}{pretty(chosen[i])}{fixed && <i aria-label="changed by context"> ✨</i>}
+          </span>
+        )
+      })}
+    </div>
+  )
+}
+
+// Framing guide. The model was trained on signers whose shoulders fill ~14-20% of the frame width; live tests
+// showed phones held ~3x closer (shoulders ~50% of the frame), which loses the second hand and distorts the
+// geometry by perspective. Hints are smoothed over ~1-2 s so they do not flicker.
+// Gate (1 Nov): Anay's failed attempts had the shoulders at 70% of the frame width and on its bottom edge (only the
+// face + one hand visible): the recogniser then guesses from fragments (cos 0.36-0.45 = noise). Past that point
+// recognition is paused and an outline shows where to stand (hysteresis so it does not flicker).
+type Framing = { n: number; far: number; near: number; oneHand: number; hint: string; bad: number; block: boolean }
+function checkFraming(raw: Raw, v: HTMLVideoElement, f: Framing, setHint: (h: string) => void,
+  setBlock: (b: boolean) => void, gate: boolean): Framing {
+  const p = raw.pose
+  let near = 0, far = 0, one = 0, bad = 0
+  if (!p) far = 1
+  else {
+    const sw = Math.hypot((p[11].x - p[12].x) * v.videoWidth, (p[11].y - p[12].y) * v.videoHeight) / v.videoWidth
+    const shoulderY = (p[11].y + p[12].y) / 2  // 0 = top, 1 = bottom of the frame
+    near = sw > 0.34 ? 1 : 0
+    far = sw < 0.1 ? 1 : 0
+    bad = sw > 0.5 || shoulderY > 0.86 ? 1 : 0
+    one = (raw.lh ? 1 : 0) + (raw.rh ? 1 : 0) === 1 ? 1 : 0
+  }
+  // running mean over the first 20 frames (so a phone held too close is caught within ~0.2 s, before any sign is
+  // guessed), then ~1 s exponential smoothing at 30 fps
+  const n = f.n + 1
+  const sm = (prev: number, x: number) => (n <= 20 ? prev + (x - prev) / n : 0.95 * prev + 0.05 * x)
+  const g: Framing = { n, near: sm(f.near, near), far: sm(f.far, far), oneHand: sm(f.oneHand, one), hint: f.hint,
+    bad: sm(f.bad, bad), block: f.block }
+  const block = gate && g.n >= 5 && (f.block ? g.bad > 0.3 : g.bad > 0.65)
+  if (block !== f.block) { setBlock(block); g.block = block }
+  const hint = g.n < 30 ? '' : g.near > 0.6 ? '📏 Move the phone back: head, shoulders and both hands should fit with space around them'
+    : g.far > 0.6 ? '📏 Come a little closer to the camera' : ''
+  if (hint !== f.hint) { setHint(hint); g.hint = hint }
+  return g
+}
+
+function localStorageGet(k: string) {
+  try { return localStorage.getItem(k) } catch { return null }
+}
+function localStorageSet(k: string, v: string | null) {
+  try { if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v) } catch { /* private mode */ }
+}
+// short names for the picker. Android: "camera2 1, facing front" -> "Front"; iPhone: "Back Ultra Wide Camera" ->
+// "Back Ultra Wide"; laptops: "HP True Vision FHD Camera (04f2:b6ab)" -> "HP True Vision FHD Camera"
+function camName(c: MediaDeviceInfo, i: number) {
+  const android = c.label.match(/^camera\d* (\d+), facing (front|back)/i)
+  if (android) {
+    const side = android[2].toLowerCase() === 'front' ? 'Front' : 'Back'
+    return android[1] === '0' || android[1] === '1' ? side : `${side} ${android[1]}`
+  }
+  const name = c.label.replace(/\s*\([0-9a-f]{4}:[0-9a-f]{4}\)/i, '').replace(/^(Front|Back)(.*) Camera$/i, '$1$2').trim()
+  return (name || `Camera ${i + 1}`).slice(0, 28)
+}
