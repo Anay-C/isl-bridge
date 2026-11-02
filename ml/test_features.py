@@ -41,9 +41,9 @@ def check(name, ok, detail=""):
     print(f"{'PASS' if ok else 'FAIL'}  {name}  {detail}", flush=True)
 
 
-def http(path, body=None, timeout=60):
+def http(path, body=None, timeout=60, headers=None):
     req = urllib.request.Request(BASE + path, data=json.dumps(body).encode() if body is not None else None,
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json", **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read() or b"null")
@@ -142,13 +142,18 @@ async def main():
             await c.send(type="feedback", **bad)
 
         # undo: sign, then undo before the pause ends -> no sentence for it
+        # (over a slow link the 0.5 s pause can end before the undo arrives: then the sentence is already out and
+        # "✏️ Wrong?" is the fix; only a sentence arriving AFTER the undo means undo failed)
         n0 = len(c.msgs)
         await c.sign(MEDICINE[0], speed=4.0)
         await c.wait("sign", since=n0)
+        n_undo = len(c.msgs)
         await c.send(type="undo")
         await asyncio.sleep(3)
-        check("undo removes the pending sign", not any(m.get("type") == "sentence" for m in c.msgs[n0:]),
-              f"messages {[m.get('type') for m in c.msgs[n0:]]}")
+        late = any(m.get("type") == "sentence" for m in c.msgs[n0:n_undo])
+        after = any(m.get("type") == "sentence" for m in c.msgs[n_undo:])
+        check("undo removes the pending sign" + (" (sentence was out before the undo: link slower than the pause)" if late else ""),
+              not after, f"messages {[m.get('type') for m in c.msgs[n0:]]}")
 
         # correct: sign Doctor, tap 'Medicine' -> sentence built from Medicine
         n0 = len(c.msgs)
@@ -214,14 +219,33 @@ async def main():
         await asyncio.sleep(0.5)
         errs = [m for m in c.msgs if m.get("type") == "error"]
         check("no error messages from the server", not errs, f"{errs[:2]}")
+
+        # "Delete my data": profile, keypoint logs and reports of this profile are gone
+        n0 = len(c.msgs)
+        await c.send(type="delete_me")
+        dm = await c.wait("deleted", since=n0)
+        gone = (not LOCAL) or not any(x.exists() for x in (DATA / "live_log" / user, DATA / "feedback" / user,
+                                                           DATA / "feedback" / f"{user}.jsonl", DATA / "users" / f"{user}.json"))
+        check("delete my data -> files removed", dm is not None and dm.get("files", 0) > 0 and gone, f"{dm}")
         c.task.cancel()
+
+    if public:  # the LAN owner's profile can't be opened (or wiped) from the public link
+        async with websockets.connect(WS, max_size=None, open_timeout=30) as ws:
+            c = Client(ws)
+            await c.send(type="hello", user="anay", scenario="hospital", log=False)
+            r = await c.wait("ready", timeout=30)
+            check("public: protected profile 'anay' -> a fresh tester id", r is not None and r.get("user", "").startswith("t-"),
+                  f"got {r and r.get('user')}")
+            c.task.cancel()
 
     # HTTP: typed reply -> ISL playlist; then the per-device limit (empty texts are refused before any Meta call)
     st, j = http("/api/text", {"text": "Take one tablet after food", "scenario": "hospital"})
     check("typed reply -> ISL playlist", st == 200 and j.get("playlist"), f"{st} {[x.get('sign') or x.get('fingerspell') for x in (j or {}).get('playlist', [])]}")
-    if public:
-        codes = [http("/api/text", {"text": ""})[0] for _ in range(45)]
-        check("public: typed replies are rate-limited per device", 429 in codes, f"codes {sorted(set(codes))}")
+    if public:  # (the burst uses ISL Lens, 8/min, so the typed-reply limit of the next run is not used up)
+        codes = [http("/api/lens", {})[0] for _ in range(12)]
+        check("public: Meta-backed routes are rate-limited per device", 429 in codes, f"codes {sorted(set(codes))}")
+        st, _ = http("/api/lens", {}, headers={"X-Forwarded-For": "1.2.3.4"})
+        check("public: a forged X-Forwarded-For does not reset the limit", st == 429, f"{st}")
         st, _ = http("/api/compose", {"candidates": []})
         check("public: debug route /api/compose is off", st == 404, f"{st}")
 

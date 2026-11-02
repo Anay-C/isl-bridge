@@ -5,7 +5,38 @@ consistency rules); this file is the current state. Owner: Anay. **Deadline: Thu
 
 ---
 
-## 000. Session 2 Nov (17:30-23:30): every sign tested, live pipeline fixed — read this first
+## 0000. Session 3 Nov (00:45-01:45): ready for outside testers — read this first
+Anay: "make it completely end to end, such that we can send it to someone to test". Guide: **`TESTING.md`**.
+Approved: public link, **$50 total Meta cap**, tester logging with notice + opt-out, local commits, delete main.py.
+- **Public link = laptop + Cloudflare quick tunnel** (`deploy/share.bat` / `deploy/share.py`): public-mode server on
+  127.0.0.1:8010 serving `web/dist` + `cloudflared` (data/tools, signature verified) -> `https://<words>.trycloudflare.com`
+  (printed, `data/share_url.txt`; changes on every restart; watchdog restarts server / tunnel). Hugging Face
+  refused the free Docker Space (**402: needs PRO**); `deploy/build_space.py` + `deploy/hf/` (Dockerfile, card,
+  `server/sync.py` private-dataset sync) are tested as a bundle (21/21 without Meta AI) for when PRO exists.
+- **Bugs a tester would have hit:** every new device logged in as "anay" (shared + overwrote his taught signs) ->
+  random `t-xxxxxx` per device, `?user=` override, home/LAN keeps "anay", `anay` is PROTECTED on the public server;
+  camera errors were raw DOMException text -> plain words + Retry; iPhone mic AudioContext created after an await
+  (suspended = silent) -> created in the tap; per-IP limit read the forgeable first X-Forwarded-For -> Cf-Connecting-Ip.
+- **New for testers:** welcome + consent (nothing logged until Start; `consent` msg; `log` in hello); **✏️ Wrong?**
+  under each sentence (ws `feedback`: sid + per-sign fixes + note -> `data/feedback/<user>.jsonl`, keypoints of
+  the corrected sign with consent -> `data/feedback/<user>/*.npz`, learned privately); 💬 feedback sheet;
+  *delete my data* (ws `delete_me`); captions-first replies (`transcript` msg 0.6 s after release, signs 4-10 s
+  later, failed = tap to retry); `ml/tester_report.py`.
+- **Cost / abuse:** `muse.check_budget()` before every Meta call (`META_SPEND_CAP_USD` in .env = 50,
+  `META_SPEND_BASE_USD` for a second ledger) -> word-by-word fallbacks (replies now use exact-name ISLRTC dictionary
+  signs instead of fingerspelling); per-signer 40 Spark calls/min (25 speculative), per-IP 40 replies/min, 8 lens/min,
+  4 summaries/min, 20 reports/min; `/api/compose` off in public mode; cross-process ledger lock (650/650 writes).
+- Also: `/api/health`, gzip (wasm 10 -> 4 MB), cache headers, `server/dictionary.py --prefetch` (82 common reply signs
+  cached), per-process temp names for dictionary clips.
+- **Tests:** `ml/test_features.py <url> [data dir]` 24/24 via the public link (twice), 20/20 LAN; test_ws 6 clients +
+  fuzz on the bundle 0 errors; headless Chrome journeys 12/12 (link + Vite) and voice + Learn 6/6 (scratchpad
+  `t/test_tester.py`, `t/test_speech.py`, fake camera/mic).
+- **Not done / to know:** no real-iPhone test; the tunnel dies with the laptop (lid/reboot) and when Claude Code's
+  background task is killed: start `deploy\share.bat` yourself for a long test; trycloudflare is for testing (no SLA).
+
+---
+
+## 000. Session 2 Nov (17:30-23:30): every sign tested, live pipeline fixed
 Anay asked: test every sign, add every possible data source, no errors when people sign. Per-sign scorecard
 (artifact): https://claude.ai/artifact/TuKSF1r14h31QaRyGieHSK (data: `data/sign_test/*.json`).
 
