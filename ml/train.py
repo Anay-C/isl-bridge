@@ -174,8 +174,31 @@ def closeup(f, rng):
     return f
 
 
+AUG_LIVE = 0.0  # --aug-live P (set in main)
+# body-space columns (see features.py): pose joint j at (2j, 2j+1); elbows 13/14 = j 7/8; hand wrist = first point of a hand
+EL_L, EL_R = 7 * 2 + 1, 8 * 2 + 1
+
+
+def live_crop(f, rng):
+    """Cut the clip the way the live segmenter does (server/segmenter.py): from a few frames before the first frame
+    with a hand raised (wrist above 1.2 shoulder widths below the shoulders, or above 2.2 and not hanging below its
+    elbow) to a few frames after the last. Training clips otherwise keep long stretches of hands at rest."""
+    raised = np.zeros(len(f), bool)
+    for body, pres, el in ((LB, LP, EL_L), (RB, RP, EL_R)):
+        wy = f[:, body + 1]
+        raised |= (f[:, pres] > 0.5) & ((wy < 1.2) | ((wy < 2.2) & (wy - f[:, el] < 0.5)))
+    r = np.flatnonzero(raised)
+    if len(r) < 3:
+        return f
+    s = max(0, r[0] - int(rng.integers(0, 16)))
+    e = min(len(f), r[-1] + 1 + int(rng.integers(0, 11)))
+    return f[s:e] if e - s >= 6 else f
+
+
 def augment(f, rng):
     """f: variable-length (T, FEAT_DIM)."""
+    if AUG_LIVE and rng.random() < AUG_LIVE:
+        f = live_crop(f, rng)
     if CLOSEUP and rng.random() < 0.35:
         f = closeup(f, rng)
     if rng.random() < 0.5:
@@ -311,9 +334,10 @@ def main():
     ap.add_argument("--aug-strong", action="store_true", help="extra different-signer augmentation")
     ap.add_argument("--aug-closeup", action="store_true", help="simulate a phone held close (perspective)")
     ap.add_argument("--gpu-frac", type=float, default=0.5, help="max share of GPU memory to use")
+    ap.add_argument("--aug-live", type=float, default=0.0, help="share of samples cut like the live segmenter cuts")
     args = ap.parse_args()
-    global STRONG, CLOSEUP
-    STRONG, CLOSEUP = args.aug_strong, args.aug_closeup
+    global STRONG, CLOSEUP, AUG_LIVE
+    STRONG, CLOSEUP, AUG_LIVE = args.aug_strong, args.aug_closeup, args.aug_live
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
 

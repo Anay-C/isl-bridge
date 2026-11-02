@@ -54,6 +54,13 @@ extraction -> mine with model_v10 -> 3 seeds `--no-islvt` -> eval. It never touc
 training clips from the same dictionary signers and no held-out clip: only iSign / new signers (`?record`) /
 personalisation can fix them.
 
+**Profiles are stamped with the model** (`ml/recognizer.py` `fingerprint()`, key `_model`): after a model change a
+stamped profile is dropped on load ("re-teach"); an old unstamped profile drops a sign whose samples look like noise to
+the current model (mean cos to their class < 0.15; Anay's Help = 0.18 on model.pt, 0.06 on another). Before deploying a
+new model, re-save existing profiles with the CURRENT model first so they are stamped (a sibling model trained from
+the same init keeps stale samples at cos ~0.2-0.3 and slips past the heuristic).
+**Tried, not adopted:** `train.py --aug-live 0.5` (cut half the training clips the way the live segmenter does):
+held-out 624 clips 77.8% vs 78.0% (3 seeds each), unseen words 71.6 vs 69.6%, but sentence recall 52.2 vs 58.8%.
 **Still weak:** I -> you (3/3), you -> you (plural), Sunday -> Friday, Good evening / Office -> good, Market -> Dress,
 Minute. Today / Thursday / Yes still sometimes get no reaction (Yes: its CISLR clip has no hand detected at all).
 **Anay before recording:** personal samples taught before today were cut without the new context frames: re-run
