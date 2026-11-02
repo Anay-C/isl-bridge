@@ -47,6 +47,27 @@ def spent():
     except Exception:
         return 0.0
 
+
+# Hard spend cap (Anay, 3 Nov: $50 for the whole $150 credit). META_SPEND_BASE_USD = what other ledgers already
+# spent (a public deployment starts its own ledger at 0, the laptop's spend is not in it). Past the cap every Meta
+# call raises BudgetExceeded and the app keeps working without it: word-by-word sentences, replies signed word by
+# word (server/app.py _plain_gloss), typed replies instead of voice, no new picture cards.
+SPEND_CAP = float(os.getenv("META_SPEND_CAP_USD", "50"))
+SPEND_BASE = float(os.getenv("META_SPEND_BASE_USD", "0"))
+
+
+class BudgetExceeded(RuntimeError):
+    pass
+
+
+def budget_left():
+    return round(SPEND_CAP - SPEND_BASE - spent(), 4)
+
+
+def check_budget():
+    if budget_left() <= 0:
+        raise BudgetExceeded(f"the demo's Meta AI credit (${SPEND_CAP:.0f}) is used up")
+
 SENTENCE_INSTRUCTIONS = """You are the voice of a Deaf person who signs Indian Sign Language (ISL) to a phone.
 A sign recogniser gives you, for each sign in order, its top candidate words with confidences.
 ISL grammar differs from English/Hindi (topic-comment, time first, question word last, no articles/copula).
@@ -132,6 +153,7 @@ SUMMARY_SCHEMA = {
 async def _spark_json(instructions, payload, name, schema, max_tokens=1000, attempts=2, tools=None, max_rounds=2):
     if _client is None:
         raise RuntimeError("MODEL_API_KEY not set in .env")
+    check_budget()
     t0 = time.perf_counter()
     tool_specs = [t["spec"] for t in tools] if tools else None
     rounds = 0
@@ -187,9 +209,14 @@ async def build_sentence(candidates, history, scenario):
     try:
         return await _spark_json(SENTENCE_INSTRUCTIONS, payload, "signed_sentence", SENTENCE_SCHEMA)
     except Exception as e:  # never leave the user without a sentence
-        words = [c[0]["label"] for c in candidates if c]
-        return {"chosen_signs": words, "english": " ".join(words), "hindi": "", "is_question": False,
-                "_error": str(e)}
+        return plain_sentence(candidates, e)
+
+
+def plain_sentence(candidates, error):
+    """Without Muse Spark (unreachable, rate limit, credit used up): the recogniser's top word for each sign."""
+    words = [c[0]["label"] for c in candidates if c]
+    return {"chosen_signs": words, "english": " ".join(words), "hindi": "", "is_question": False,
+            "_error": str(error)}
 
 
 LENS_INSTRUCTIONS = """A learner of Indian Sign Language points a phone camera at something. Name the main object
@@ -213,6 +240,7 @@ async def identify_object(image_data_url, app_signs=()):
     """Camera frame (data URL) -> {"object", "alternatives", "hindi", "app_sign"} via Muse Spark vision."""
     if _client is None:
         raise RuntimeError("MODEL_API_KEY not set in .env")
+    check_budget()
     t0 = time.perf_counter()
     r = await _client.responses.create(
         model=SPARK, instructions=LENS_INSTRUCTIONS, reasoning={"effort": "minimal"}, max_output_tokens=600,
@@ -255,8 +283,12 @@ async def summarise(history, scenario):
     try:
         return await _spark_json(SUMMARY_INSTRUCTIONS, payload, "visit_note", SUMMARY_SCHEMA, max_tokens=1500)
     except Exception as e:  # without Spark, still hand over the raw transcript
-        return {"chief_complaint": "", "symptoms": [], "medicines_mentioned": [], "allergies": [], "to_confirm": [],
-                "summary_english": "\n".join(history), "summary_hindi": "", "_error": str(e)}
+        return plain_summary(history, e)
+
+
+def plain_summary(history, error):
+    return {"chief_complaint": "", "symptoms": [], "medicines_mentioned": [], "allergies": [], "to_confirm": [],
+            "summary_english": "\n".join(history), "summary_hindi": "", "_error": str(error)}
 
 
 class RealtimeASR:
@@ -276,6 +308,7 @@ class RealtimeASR:
         import websockets
         if not KEY:
             raise RuntimeError("MODEL_API_KEY not set in .env")
+        check_budget()
         self.ws = await websockets.connect(self.URL, max_size=None, open_timeout=10)
         await self.ws.send(json.dumps({
             "authorization": {"accessToken": f"Bearer {KEY}"}, "audioEncoding": "PCM_16KHZ", "model": ASR,
@@ -326,6 +359,7 @@ class RealtimeASR:
 async def transcribe_wav(wav_bytes, keywords=(), languages=("English", "Hindi")):
     if not KEY:
         raise RuntimeError("MODEL_API_KEY not set in .env")
+    check_budget()
     req = {"mode": "PUSH_TO_TALK", "model": ASR, "audioEncoding": "WAV",
            "languageBias": list(languages), "keywords": list(keywords)[:100]}
     t0 = time.perf_counter()

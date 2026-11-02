@@ -265,3 +265,34 @@ a.pill { text-decoration: none; }
 .lens video { width: 100%; max-height: 30vh; object-fit: contain; border-radius: 12px; background: #000; }
 .lens p { margin: 0; }
 .lens .primary { padding: 10px; border-radius: 12px; border: none; background: var(--accent); color: #fff; font-weight: 700; }
+
+/* ---- Testing: welcome, "✏️ Wrong?" reports, feedback, toast, camera retry (3 Nov) ------------------------- */
+.welcome-sheet { align-items: center; z-index: 40; }
+.welcome { border-radius: 20px; max-height: 92vh; }
+.welcome h3 { font-size: 22px; }
+.welcome p { color: var(--fg); font-size: 15px; line-height: 1.45; }
+.welcome .steps { margin: 0 0 12px; padding-left: 22px; display: grid; gap: 7px; font-size: 15px; line-height: 1.4; }
+.welcome .fine { color: var(--muted); font-size: 12.5px; }
+.consent { display: flex; gap: 10px; align-items: flex-start; background: var(--accent-soft); border: 1px solid var(--accent); border-radius: 14px;
+  padding: 10px 12px; margin: 0 0 10px; font-size: 14px; line-height: 1.4; cursor: pointer; }
+.consent input { width: 20px !important; height: 20px; margin: 1px 0 0 !important; flex: none; accent-color: var(--accent); }
+.welcome .primary { width: 100%; }
+.sheet-body textarea { width: 100%; box-sizing: border-box; min-height: 84px; padding: 12px; border-radius: 12px; border: 1px solid var(--line);
+  background: var(--card); color: var(--fg); font: inherit; font-size: 16px; margin-bottom: 8px; resize: vertical; }
+.fix-signs { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; margin-bottom: 8px; }
+.fix-signs label { display: grid; gap: 4px; }
+.fix-signs small { color: var(--muted); font-size: 12px; }
+.fix-signs input { margin: 0; }
+.fix-btn { display: block; margin-top: 6px; background: none; border: none; padding: 2px 0; color: var(--accent); font-size: 13px; font-weight: 600; text-align: left; }
+.bubble .reported { color: var(--ok); }
+.toast { position: fixed; left: 50%; bottom: 92px; transform: translateX(-50%); z-index: 50; max-width: min(520px, calc(100% - 32px)); box-sizing: border-box;
+  background: var(--fg); color: var(--bg); padding: 10px 16px; border-radius: 14px; font-size: 14px; font-weight: 600; box-shadow: 0 8px 24px rgba(0,0,0,.25);
+  animation: toast-in .25s ease-out; }
+@keyframes toast-in { from { opacity: 0; transform: translate(-50%, 6px); } to { opacity: 1; transform: translate(-50%, 0); } }
+.cam-retry { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 5; padding: 12px 18px; border-radius: 14px; border: none;
+  background: var(--accent); color: #fff; font-weight: 800; font-size: 16px; }
+.profile-row { font-size: 13px !important; margin: 12px 0 0 !important; }
+.profile-row code { font-size: 12px; background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 1px 5px; }
+.about .row { display: flex; gap: 8px; }
+.about .row button { flex: 1; padding: 12px; border-radius: 12px; border: none; background: var(--accent); color: #fff; font-weight: 700; font-size: 16px; }
+.about .row button.secondary { background: var(--card); color: var(--fg); border: 1px solid var(--line); }

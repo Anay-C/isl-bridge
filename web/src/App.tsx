@@ -8,8 +8,38 @@ import Cutout from './Cutout'
 import Ghost, { ghostMs, loadGhost, type GhostRef } from './Ghost'
 
 type Cand = { label: string; p: number }
-// cands: the top-3 per sign that Muse Spark chose from; chosen: what it picked (shows context corrections)
-type Turn = { who: 'deaf' | 'hearing'; text: string; sub?: string; ms?: number; playlist?: Clip[]; cands?: Cand[][]; chosen?: string[]; typed?: boolean }
+// cands: the top-3 per sign that Muse Spark chose from; chosen: what it picked (shows context corrections);
+// sid: the server's id of a signed sentence ("✏️ Wrong?" reports refer to it)
+type Turn = { who: 'deaf' | 'hearing'; text: string; sub?: string; ms?: number; playlist?: Clip[]; cands?: Cand[][]; chosen?: string[]; typed?: boolean; sid?: number; reported?: boolean }
+type Fix = { turn: number; sid?: number; signs: string[]; meant: string[]; note: string } | null
+
+// Every device gets its own private profile (taught signs). Anay's own setup (localhost / home Wi-Fi) keeps
+// "anay"; a tester opening the public link gets a random id. ?user=NAME picks a profile explicitly (remembered).
+function initialUser() {
+  const clean = (s: string) => s.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40)
+  const q = clean(new URLSearchParams(location.search).get('user') ?? '')
+  if (q) { localStorageSet('isl-user', q); return q }
+  const saved = localStorageGet('isl-user')
+  if (saved) return saved
+  const home = /^(localhost|127\.|192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(location.hostname)
+  const id = home ? 'anay' : `t-${Math.random().toString(36).slice(2, 8)}`
+  localStorageSet('isl-user', id)
+  return id
+}
+function newProfile() {
+  localStorageSet('isl-user', `t-${Math.random().toString(36).slice(2, 8)}`)
+  localStorageSet('isl-setup-later', null)
+  location.href = location.pathname  // drop ?user= so the new id sticks
+}
+// camera failures in plain words (the raw DOMException names mean nothing to a tester)
+function cameraHelp(e: Error) {
+  if (!navigator.mediaDevices) return 'The camera needs a secure (https) link. Open the https:// address.'
+  if (e.name === 'NotAllowedError' || e.name === 'SecurityError')
+    return 'Camera blocked. Allow the camera for this site (tap the 🔒 or ⓘ next to the address, then Permissions), then tap Retry.'
+  if (e.name === 'NotFoundError' || e.name === 'OverconstrainedError') return 'No camera found on this device.'
+  if (e.name === 'NotReadableError' || e.name === 'AbortError') return 'The camera is busy in another app or tab. Close it, then tap Retry.'
+  return `Camera error: ${e.message}`
+}
 type Clip = { sign?: string; clip?: string; cutout?: string; cutout_box?: number[]; fingerspell?: string; dictionary?: boolean; picture?: string }
 type Enroll = { label: string; n: number; reps: number } | null
 type Report = { label: string; kept: number; dropped: number; self_test: number; confused_with: string[] }
@@ -113,7 +143,20 @@ export default function App() {
   const [turns, setTurns] = useState<Turn[]>([])
   const [lang, setLang] = useState<'en' | 'hi'>('en')
   const [scenario, setScenario] = useState('hospital')
-  const [user] = useState(() => localStorageGet('isl-user') ?? 'anay')
+  const [user] = useState(initialUser)
+  // first visit: welcome + how to test + "help improve" choice (keypoints only, never video). Until it is
+  // answered nothing is logged.
+  const [welcome, setWelcome] = useState(() => localStorageGet('isl-welcome') !== '1')
+  const [logOk, setLogOk] = useState(() => localStorageGet('isl-log') !== '0')
+  const logRef = useRef(logOk && !welcome)
+  const [server, setServer] = useState<{ metaAi: boolean; version: string; public: boolean }>({ metaAi: true, version: '', public: false })
+  const [camError, setCamError] = useState('')
+  const [camTry, setCamTry] = useState(0)
+  const [fix, setFix] = useState<Fix>(null)
+  const [noteOpen, setNoteOpen] = useState(false)
+  const [note, setNote] = useState('')
+  const [toast, setToast] = useState('')
+  useEffect(() => { if (toast) { const t = setTimeout(() => setToast(''), 4500); return () => clearTimeout(t) } }, [toast])
   const [vocab, setVocab] = useState<string[]>([])
   const [enroll, setEnroll] = useState<Enroll>(null)
   const [teachOpen, setTeachOpen] = useState(false)
@@ -149,7 +192,12 @@ export default function App() {
   const langRef = useRef(lang)
   langRef.current = lang
 
-  const send = (m: object) => ws.current?.readyState === 1 && ws.current.send(JSON.stringify(m))
+  const send = (m: object) => {
+    const sock = ws.current
+    if (sock?.readyState !== 1) return false
+    sock.send(JSON.stringify(m))
+    return true
+  }
   const scenarioRef = useRef(scenario)
   scenarioRef.current = scenario
   // scenario change: tell the open connection (reconnecting would drop the conversation history)
@@ -164,14 +212,19 @@ export default function App() {
     const sock = new WebSocket(`${proto}://${location.host}/ws/sign`)
     ws.current = sock
     sock.onopen = () => {
-      sock.send(JSON.stringify({ type: 'hello', user, scenario: scenarioRef.current, mode: learnMode ? 'learn' : 'talk' }))
+      sock.send(JSON.stringify({ type: 'hello', user, scenario: scenarioRef.current, mode: learnMode ? 'learn' : 'talk', log: logRef.current }))
       setPending([])
       setEnroll(null)
       setStatus((st) => (st === 'Disconnected from server' || st.startsWith('Reconnecting') ? 'Ready — sign to the camera' : st))
     }
     sock.onmessage = (ev) => {
       const m = JSON.parse(ev.data)
-      if (m.type === 'ready') { setVocab(m.vocab); setPersonal(m.personal); if (!m.model && !recordMode) setStatus('Model not trained yet') }
+      if (m.type === 'ready') {
+        setVocab(m.vocab); setPersonal(m.personal)
+        setServer({ metaAi: m.meta_ai !== false, version: m.version ?? '', public: !!m.public })
+        if (!m.model && !recordMode) setStatus('Model not trained yet')
+      }
+      else if (m.type === 'feedback_ok') setToast(m.learned?.length ? `Thanks! Saved, and it learned your “${m.learned.map(pretty).join('”, “')}”.` : 'Thanks! Your report is saved.')
       else if (m.type === 'summary') setSummary(m)
       else if (m.type === 'practice_result') setPractice(m)
       else if (m.type === 'personal') { setPersonal(m.personal); setVocab(m.vocab) }
@@ -200,7 +253,7 @@ export default function App() {
         setComposing(false)
         setPending((p) => p.slice(m.n ?? p.length))  // signs made while Spark was writing stay pending
         const text = langRef.current === 'hi' && m.hindi ? m.hindi : m.english
-        setTurns((t) => [...t, { who: 'deaf', text, sub: m.chosen_signs.map(pretty).join(' · '), ms: m._latency_ms, cands: m.cands, chosen: m.chosen_signs }])
+        setTurns((t) => [...t, { who: 'deaf', text, sub: m.chosen_signs.map(pretty).join(' · '), ms: m._latency_ms, cands: m.cands, chosen: m.chosen_signs, sid: m.sid }])
         sayAloud(text, langRef.current)
       } else if (m.type === 'enroll_progress') {
         setEnroll(m.n >= m.reps ? null : m)
@@ -236,6 +289,7 @@ export default function App() {
           throw new Error('saved camera not found, switching to the default one')
         })
       if (stop) { stream.getTracks().forEach((t) => t.stop()); return }
+      setCamError('')
       const track = stream.getVideoTracks()[0]
       if (source === 'camera') {
         const st = track.getSettings()
@@ -272,9 +326,14 @@ export default function App() {
         requestAnimationFrame(loop)
       }
       loop()
-    })().catch((e) => { setStatus(`${source === 'screen' ? 'Screen share' : 'Camera'} error: ${e.message}`); if (source === 'screen') setSource('camera') })
+    })().catch((e) => {
+      if (source === 'screen') { setStatus(`Screen share error: ${e.message}`); setSource('camera'); return }
+      const help = cameraHelp(e)
+      setStatus(help)
+      setCamError(help)
+    })
     return () => { stop = true; stream?.getTracks().forEach((t) => t.stop()) }
-  }, [source, camId])
+  }, [source, camId, camTry])
 
   // ---- Hearing person: hold to talk -> clips --------------------------------------------------
   // Realtime: mic PCM streams to /ws/speech while held (live captions); falls back to uploading the WAV.
@@ -430,6 +489,41 @@ export default function App() {
   }
 
   const toggleGhost = () => { const v = !ghostOn; setGhostOn(v); localStorageSet('isl-ghost', v ? '1' : '0') }
+  // "help improve": the server keeps this person's sign keypoints only while it is on
+  const setConsent = (v: boolean) => {
+    setLogOk(v); logRef.current = v; localStorageSet('isl-log', v ? '1' : '0')
+    send({ type: 'consent', log: v })
+  }
+  const acceptWelcome = () => {
+    unlockVoice()  // this tap also lets the phone speak later sentences
+    setVoiceBlocked(null)
+    setWelcome(false); localStorageSet('isl-welcome', '1')
+    setConsent(logOk)
+  }
+  // "✏️ Wrong?" on a signed sentence: what the person really signed, sign by sign, plus an optional note
+  const openFix = (i: number) => {
+    const t = turns[i]
+    const signs = t.chosen?.length === t.cands?.length ? t.chosen! : (t.cands ?? []).map((c) => c[0]?.label ?? '')
+    setFix({ turn: i, sid: t.sid, signs, meant: signs.map(pretty), note: '' })
+  }
+  const sendFix = () => {
+    if (!fix) return
+    const byPretty = new Map(vocab.map((v) => [pretty(v).toLowerCase(), v]))
+    const signs = fix.meant.map((m, i) => ({ i, meant: byPretty.get(m.trim().toLowerCase()) ?? m.trim() }))
+      .filter((x, i) => x.meant && x.meant !== fix.signs[i])
+    if (!signs.length && !fix.note.trim()) { setFix(null); return }
+    if (!send({ type: 'feedback', sid: fix.sid, signs, note: fix.note.trim(), device: navigator.userAgent })) {
+      setToast('Not connected to the server - try again in a moment'); return
+    }
+    setTurns((ts) => ts.map((t, i) => (i === fix.turn ? { ...t, reported: true } : t)))
+    setFix(null)
+  }
+  const sendNote = () => {
+    if (note.trim() && !send({ type: 'feedback', note: note.trim(), device: navigator.userAgent })) {
+      setToast('Not connected to the server - try again in a moment'); return
+    }
+    setNote(''); setNoteOpen(false)
+  }
   const talkMode = !learnMode && !recordMode
   const stopPlayback = () => { setPlaylist([]); setClipIdx(0) }
   const credit = (
@@ -449,6 +543,7 @@ export default function App() {
             onClick={() => setSource(source === 'screen' ? 'camera' : 'screen')}>{source === 'screen' ? '📷 Camera' : '📺 Video'}</button>}
           {!learnMode && <button className={`pill wide-only ${ghostOn ? 'on' : ''}`} title="Ghost signer: replies are signed by a ghost figure instead of videos" onClick={toggleGhost}>👻</button>}
           <a className="pill wide-only" href={learnMode ? '?' : '?learn'}>{learnMode ? '💬 Talk' : '🎓 Learn'}</a>
+          <button className="pill wide-only" title="Send feedback to the ISL Bridge team" onClick={() => setNoteOpen(true)}>💬 Feedback</button>
           <button className="pill wide-only" aria-label="About and privacy" onClick={() => setAboutOpen(true)}>ⓘ</button>
           <button className="pill narrow-only" aria-label="Menu" onClick={() => setMenuOpen(true)}>☰</button>
           <button className="pill sos-pill" onClick={() => setSos('offer')}>SOS</button>
@@ -477,6 +572,9 @@ export default function App() {
               <span>Your head, shoulders and both hands must fit in the picture, like the outline. Signs are not read until then.</span>
             </div>
           </div>
+        )}
+        {camError && !current && source === 'camera' && (
+          <button className="cam-retry" onClick={() => { setCamError(''); setStatus('Starting camera…'); setCamTry((n) => n + 1) }}>↻ Retry camera</button>
         )}
         {!current && <div className="status">{enroll ? `Teaching “${enroll.label}” — sign it (${enroll.n}/${enroll.reps})` : signing ? (learnMode ? '● Signing…' : '● Signing… lower your hands when you finish') : composing && !learnMode ? '✍️ Writing the sentence…' : status}</div>}
         {!current && !signing && !enroll && talkMode && source === 'camera' && <div className="privacy" title="Hand and body keypoints are computed on this device; only those numbers are sent">🔒 Video stays on this device</div>}
@@ -574,6 +672,9 @@ export default function App() {
                     ? <div className="trail">{t.playlist.map((c, j) => <span key={j} className={`tchip ${c.dictionary ? 'dict' : ''} ${c.sign ? '' : 'spell'}`}>{c.sign ? pretty(c.sign) : c.fingerspell}</span>)}</div>
                     : t.sub && <small>{t.sub}</small>}
                 {t.ms ? <small className="ms">{t.who === 'deaf' ? 'Muse Spark' : 'to ISL'} · {(t.ms / 1000).toFixed(1)} s{t.who === 'hearing' && t.playlist?.length ? ' · tap to replay ▶' : ''}</small> : null}
+                {t.who === 'deaf' && t.sid !== undefined && (t.reported
+                  ? <small className="reported">✓ Reported, thanks</small>
+                  : <button className="fix-btn" onClick={(e) => { e.stopPropagation(); openFix(i) }}>✏️ Wrong? Tell us what you signed</button>)}
               </div>
             ))}
             {live && <div className="bubble hearing live"><div className="who">🎤 Listening…</div><div className="text">{live}</div></div>}
@@ -585,17 +686,74 @@ export default function App() {
         {talkMode && (
           <footer className="controls">
             <button className="ctl" onClick={() => setTeachOpen(true)}><span aria-hidden="true">✋</span><small>Teach</small></button>
-            <button
-              className={`mic ${recording ? 'rec' : ''}`}
-              onPointerDown={startTalk} onPointerUp={stopTalk} onPointerLeave={() => recording && stopTalk()}
-              onContextMenu={(e) => e.preventDefault()}
-            >{recording ? 'Listening… release to send' : '🎤 Hold to speak'}</button>
+            {server.metaAi ? (
+              <button
+                className={`mic ${recording ? 'rec' : ''}`}
+                onPointerDown={startTalk} onPointerUp={stopTalk} onPointerLeave={() => recording && stopTalk()}
+                onContextMenu={(e) => e.preventDefault()}
+              >{recording ? 'Listening… release to send' : '🎤 Hold to speak'}</button>
+            ) : (
+              <button className="mic" onClick={() => setTypeOpen(true)} title="The demo's Meta AI credit is used up, so voice is off">⌨️ Type the reply (voice is off)</button>
+            )}
             <button className="ctl" aria-label="Type a reply" onClick={() => setTypeOpen(true)}><span aria-hidden="true">⌨️</span><small>Type</small></button>
             <button className="ctl" disabled={turns.length < 2} onClick={() => { setSummary('loading'); send({ type: 'summary' }) }}><span aria-hidden="true">📋</span><small>Summary</small></button>
           </footer>
         )}
       </div>
 
+      {welcome && talkMode && (
+        <div className="sheet welcome-sheet">
+          <div className="sheet-body welcome">
+            <h3>🤟 Welcome to ISL Bridge</h3>
+            <p>A conversation app for a Deaf person who signs <b>Indian Sign Language</b> and a hearing person, on one phone. This is a test version: your feedback makes it better.</p>
+            <ol className="steps">
+              <li><b>Stand back.</b> Prop the phone up so your head, shoulders and both hands are in the picture, in good light.</li>
+              <li><b>Sign, then lower your hands.</b> One word or a short sentence, e.g. <i>HELLO</i>, <i>DOCTOR</i>, <i>PAIN · HEAD</i>. The phone speaks it.</li>
+              <li><b>Wrong?</b> Tap <b>✏️ Wrong?</b> under the sentence and fix the words. It learns your signing, and we see what failed.</li>
+              <li><b>Reply:</b> the hearing person holds <b>🎤</b> and talks (English or Hindi), or types ⌨️. The words come back as ISL signs.</li>
+              <li>Don't know ISL? <b>🎓 Learn</b> shows each sign to copy. <b>✋ Teach</b> makes the app learn your own way of signing a word.</li>
+            </ol>
+            <label className="consent">
+              <input type="checkbox" checked={logOk} onChange={(e) => setLogOk(e.target.checked)} />
+              <span><b>Help improve ISL Bridge:</b> save the hand and body keypoints of my signs (numbers only, never video) and my reports. You can switch this off any time (ⓘ / ☰).</span>
+            </label>
+            <p className="fine">🔒 Your camera video never leaves this phone. Speech you record is sent to Meta AI to be transcribed. Translations can be wrong, so don't rely on it for anything urgent.</p>
+            <button className="primary" onClick={acceptWelcome}>Start</button>
+          </div>
+        </div>
+      )}
+      {fix && (
+        <div className="sheet" onClick={() => setFix(null)}>
+          <div className="sheet-body" onClick={(e) => e.stopPropagation()}>
+            <h3>✏️ What did you sign?</h3>
+            <p>Change each word that was read wrong and leave the right ones. The app learns your corrections (privately), and the team sees what went wrong.</p>
+            <div className="fix-signs">
+              {fix.signs.map((sg, i) => (
+                <label key={i}><small>Sign {i + 1}, read as <b>{pretty(sg)}</b></small>
+                  <input list="isl-vocab" value={fix.meant[i]} onFocus={(e) => e.target.select()} aria-label={`What sign ${i + 1} really was`}
+                    onChange={(e) => setFix({ ...fix, meant: fix.meant.map((x, j) => (j === i ? e.target.value : x)) })} />
+                </label>
+              ))}
+            </div>
+            <datalist id="isl-vocab">{vocab.map((v) => <option key={v} value={pretty(v)} />)}</datalist>
+            <textarea placeholder="Anything else? e.g. “I signed 3 signs, it read 2”, “it was slow”" value={fix.note}
+              onChange={(e) => setFix({ ...fix, note: e.target.value })} />
+            <button onClick={sendFix}>Send</button>
+            <button className="secondary" onClick={() => setFix(null)}>Cancel</button>
+          </div>
+        </div>
+      )}
+      {noteOpen && (
+        <div className="sheet" onClick={() => setNoteOpen(false)}>
+          <div className="sheet-body" onClick={(e) => e.stopPropagation()}>
+            <h3>💬 Feedback</h3>
+            <p>What was confusing, slow or wrong? What would make it useful? It goes to the ISL Bridge team, with the last few sentences of this conversation.</p>
+            <textarea autoFocus value={note} onChange={(e) => setNote(e.target.value)} placeholder="Your feedback" />
+            <button onClick={sendNote} disabled={!note.trim()}>Send</button>
+          </div>
+        </div>
+      )}
+      {toast && <div className="toast" role="status">{toast}</div>}
       {typeOpen && (
         <div className="sheet" onClick={() => setTypeOpen(false)}>
           <div className="sheet-body" onClick={(e) => e.stopPropagation()}>
@@ -629,9 +787,20 @@ export default function App() {
             <a className="menu-row" href={learnMode ? '?' : '?learn'}>
               <span>{learnMode ? '💬 Back to the conversation' : '🎓 Learn ISL'}<small>{learnMode ? '' : 'Ghost Coach: copy the signer, get stars and tips'}</small></span>
             </a>
+            <button className="menu-row" onClick={() => { setMenuOpen(false); setWelcome(true) }}>
+              <span>📝 How to test<small>What to try, and how to report mistakes</small></span>
+            </button>
+            <button className="menu-row" onClick={() => { setMenuOpen(false); setNoteOpen(true) }}>
+              <span>💬 Send feedback<small>Anything that was confusing, slow or wrong</small></span>
+            </button>
+            <button className="menu-row" onClick={() => setConsent(!logOk)}>
+              <span>🔬 Help improve ISL Bridge<small>Save the hand and body keypoints of my signs (numbers, never video)</small></span>
+              <span className={`toggle ${logOk ? 'on' : ''}`} aria-hidden="true" />
+            </button>
             <button className="menu-row" onClick={() => { setMenuOpen(false); setAboutOpen(true) }}>
               <span>ⓘ About, privacy &amp; credits</span>
             </button>
+            <p className="profile-row">👤 Profile <code>{user}</code> · <button className="linkish" onClick={() => { if (confirm('Start with a new, empty profile on this device? Signs you taught stay with the old one.')) newProfile() }}>start fresh</button></p>
           </div>
         </div>
       )}
@@ -642,7 +811,8 @@ export default function App() {
             <p>A two-way conversation between a Deaf person who signs Indian Sign Language and a hearing person, on one phone.</p>
             <ul>
               <li>🔒 <b>Your signing video never leaves this device.</b> Hand and body keypoints are computed on the phone; only those numbers go to the server.</li>
-              <li>✋ Signs you teach are stored only in your profile and are never used to train the shared model.</li>
+              <li>✋ Signs you teach are stored only in your private profile on the server and are never used to train the shared model.</li>
+              <li>🔬 While <b>Help improve</b> is on, the keypoints of your signs and your “Wrong?” reports are saved, so the team can find mistakes and improve the recogniser. Speech you record is sent to Meta AI to be transcribed.</li>
               <li>⚠️ Machine translation can be wrong. For anything important, confirm with the Deaf person; the visit summary lists what to double-check.</li>
             </ul>
             <h4>Powered by Meta AI</h4>
@@ -652,8 +822,17 @@ export default function App() {
               <li><b>SAM 3.1</b>: cuts the human signer out of each sign video so they appear in your camera view.</li>
               <li><b>PyTorch</b>: the sign recogniser (keypoint Transformer + personal prototypes).</li>
             </ul>
+            <button className="menu-row" onClick={() => setConsent(!logOk)}>
+              <span>🔬 Help improve ISL Bridge<small>Save the hand and body keypoints of my signs and my reports (numbers, never video), so the team can fix mistakes</small></span>
+              <span className={`toggle ${logOk ? 'on' : ''}`} aria-hidden="true" />
+            </button>
+            <p className="profile-row">👤 Profile <code>{user}</code> · <button className="linkish" onClick={() => { if (confirm('Start with a new, empty profile on this device? Signs you taught stay with the old one.')) newProfile() }}>start fresh</button>
+              {server.version && <> · build <code>{server.version}</code></>}</p>
             {credit}
-            <button onClick={() => setAboutOpen(false)}>Close</button>
+            <div className="row">
+              <button onClick={() => { setAboutOpen(false); setWelcome(true) }} className="secondary">📝 How to test</button>
+              <button onClick={() => setAboutOpen(false)}>Close</button>
+            </div>
           </div>
         </div>
       )}
