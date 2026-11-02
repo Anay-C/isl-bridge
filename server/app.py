@@ -7,7 +7,12 @@ WebSocket /ws/sign  (client -> server JSON)
     {"type":"frame", "w":640, "h":480, "pose":[132 floats]|null, "lh":[63]|null, "rh":[63]|null}
     {"type":"enroll", "label":"Pain", "reps":5}   next N signs become personal samples
     {"type":"undo"} | {"type":"speak_now"} | {"type":"reset"}
-server -> client: state / sign / sentence / enroll_progress / error
+    {"type":"feedback", "sid":3, "signs":[{"i":0,"meant":"Pain"}], "note":"..."}   "that was wrong"
+    {"type":"consent", "log":false}   stop saving this person's sign keypoints
+server -> client: state / sign / sentence / enroll_progress / feedback_ok / error
+
+Public deployment (ISL_PUBLIC=1, deploy/hf): debug routes off, per-client rate limits, the Meta spend cap
+(server/muse.py) and tester data copied to a private HF dataset (server/sync.py).
 """
 import asyncio
 import json
@@ -16,12 +21,15 @@ import re
 import sys
 import time
 import traceback
+from collections import deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
-from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "ml"))
@@ -36,8 +44,12 @@ import segmenter  # noqa: E402
 from segmenter import Segmenter  # noqa: E402
 import muse  # noqa: E402
 import pictures  # noqa: E402
+import sync  # noqa: E402
 
 DATA = ROOT / "data"
+PUBLIC = os.environ.get("ISL_PUBLIC") == "1"  # open to the internet (Hugging Face Space)
+VERSION = os.environ.get("ISL_VERSION", "dev")
+FEEDBACK = DATA / "feedback"  # <user>.jsonl mistake reports (+ <user>/*.npz keypoints of corrected signs)
 # ISL_MODEL: checkpoint(s) to serve, comma-separated = ensemble (ml/recognizer.py); ISL_DEVICE: cpu | cuda
 MODEL = os.environ.get("ISL_MODEL") or str(DATA / "model.pt")
 DEVICE = os.environ.get("ISL_DEVICE", "cpu")
@@ -57,14 +69,101 @@ SPEC_MAX = 6  # speculative Spark calls per stretch of signing (~$0.001 each)
 INTERIM_EVERY_S = 0.5  # live guesses while signing: at most one decode in flight, at most this often
 INTERIM_MAX_FRAMES = 150  # decode only the latest ~5 s for live guesses (the final decode uses everything)
 MAX_PERSONAL = 20  # newest personal samples kept per sign (teaching + corrections)
+# Meta calls per signer per minute. A normal conversation makes ~5-20 (one per sentence + a few speculative ones);
+# a phone left facing a TV must not drain the shared credit. Over SPEC_PER_MIN no more speculative calls; over
+# SPARK_PER_MIN sentences are word by word until the minute has passed.
+SPARK_PER_MIN = int(os.environ.get("SPARK_PER_MIN", 40))
+SPEC_PER_MIN = int(os.environ.get("SPEC_PER_MIN", 25))
+SESSIONS: set = set()
+STARTED = time.time()
 
-app = FastAPI(title="ISL conversation")
+
+class Rate:
+    """At most n events per `per` seconds for each key (a session, or a client IP for the HTTP routes)."""
+
+    def __init__(self, n, per=60.0):
+        self.n, self.per, self.t = n, per, {}
+
+    def count(self, key):
+        q = self.t.get(key)
+        now = time.monotonic()
+        while q and now - q[0] > self.per:
+            q.popleft()
+        return len(q) if q else 0
+
+    def ok(self, key="", limit=None):
+        if self.count(key) >= (self.n if limit is None else limit):
+            return False
+        if len(self.t) > 10000:  # forget idle clients
+            self.t = {k: q for k, q in self.t.items() if q and time.monotonic() - q[-1] < self.per}
+        self.t.setdefault(key, deque()).append(time.monotonic())
+        return True
+
+
+RATE_HTTP = Rate(int(os.environ.get("HTTP_PER_MIN", 20)))  # typed / spoken replies per client IP
+RATE_LENS = Rate(int(os.environ.get("LENS_PER_MIN", 8)))
+RATE_SPEECH = Rate(int(os.environ.get("SPEECH_PER_MIN", 20)))
+
+
+def client_ip(r):
+    """Request or WebSocket -> the visitor's IP (behind the Hugging Face proxy: X-Forwarded-For)."""
+    xf = r.headers.get("x-forwarded-for", "")
+    return xf.split(",")[0].strip() or (r.client.host if r.client else "?")
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    sync.restore()  # public deployment: testers' profiles + the spend ledger survive a restart
+    sync.start()
+    recognizer()  # load the model before the first visitor, not during their first sign
+    yield
+    sync.flush()
+
+
+app = FastAPI(title="ISL conversation", lifespan=lifespan)
 _recognizer: Recognizer | None = None
+
+
+class _SelectiveGZip:
+    """gzip the app bundle, the MediaPipe wasm (10 MB -> ~3 MB on a phone's data plan) and JSON; never videos
+    (Safari plays them with byte-range requests, which compression would break)."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.gz = GZipMiddleware(inner, minimum_size=1024)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].startswith(("/assets/", "/wasm/", "/api/")):
+            return await self.gz(scope, receive, send)
+        return await self.inner(scope, receive, send)
+
+
+app.add_middleware(_SelectiveGZip)
+
+
+@app.middleware("http")
+async def _cache_headers(request: Request, call_next):
+    """Repeat visits load instantly: hashed bundles are immutable, models / wasm / clips change rarely."""
+    resp = await call_next(request)
+    p = request.url.path
+    if resp.status_code == 200 and "cache-control" not in resp.headers:
+        if p.startswith("/assets/"):
+            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        elif p.startswith(("/wasm/", "/models/")):
+            resp.headers["Cache-Control"] = "public, max-age=604800"
+        elif p.startswith(("/clips", "/pictures/")):
+            resp.headers["Cache-Control"] = "public, max-age=86400"
+        elif not p.startswith(("/api/", "/ws/")):
+            resp.headers["Cache-Control"] = "no-cache"  # index.html: always pick up a new deployment
+    return resp
 
 
 def recognizer():
     global _recognizer
     if _recognizer is None and all(Path(p).exists() for p in MODEL.split(",")):
+        if os.environ.get("TORCH_THREADS"):  # e.g. 2 on a 2-vCPU Space
+            import torch
+            torch.set_num_threads(int(os.environ["TORCH_THREADS"]))
         _recognizer = Recognizer(MODEL, device=DEVICE)
         print(f"[server] recogniser: {MODEL} on {DEVICE}", flush=True)
         _recognizer.active = scenario_vocab("general")
@@ -148,12 +247,32 @@ class Session:
         self.quiet_until = 0.0  # just finished teaching: the end of the last rep is not a conversation sign
         self.down_t = 0.0  # when the hands last went down (the sentence pause is counted from here)
         self.errors = 0  # messages that raised (logged; the session carries on)
+        self.log_ok = True  # "help improve ISL Bridge": keep this person's sign keypoints (they can switch it off)
+        self.spark = Rate(SPARK_PER_MIN)  # this signer's Meta calls in the last minute
+        self.summaries = Rate(4)
+        self.client_logs = 0
+        # "that was wrong" reports: the keypoints of the last stretches of signing, and for each pending sign
+        # which stretch (and frames) it came from; spoken sentences keep their signs for a while
+        self.segs: deque = deque(maxlen=12)  # (seg_id, {"pose", "lh", "rh", "lh_p", "rh_p", "fps"})
+        self.seg_id = 0
+        self.pending_src: list[tuple] = []  # (seg_id, start, end) per pending sign
+        self.sentences: dict[int, dict] = {}  # sid -> {"cands", "embs", "src", "english"}
+        self.sid = 0
 
     async def send(self, **msg):
         await self.ws.send_text(json.dumps(msg, ensure_ascii=False))
 
+    def spark_ok(self, speculative=False):
+        """A Meta call for this signer is within the per-minute limit (and the credit is not used up)."""
+        if muse.budget_left() <= 0:
+            return False
+        return self.spark.ok("s", SPEC_PER_MIN if speculative else None)
+
     def _log_live(self, pose, lh, rh, lh_p, rh_p, top):
-        """Keep every live segment so live accuracy problems can be diagnosed (data/ is git-ignored)."""
+        """Keep every live segment so live accuracy problems can be diagnosed (data/ is git-ignored).
+        Only while the person leaves "help improve ISL Bridge" on (the welcome screen says so)."""
+        if not self.log_ok:
+            return
         try:
             out = LIVE_LOG / self.user / f"{time.strftime('%Y%m%d-%H%M%S')}-{len(self.pending)}.npz"
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -262,7 +381,7 @@ class Session:
                if rec else None)
         ms = round((time.perf_counter() - t0) * 1000)
 
-        if self.enroll and self.enroll.get("save"):
+        if self.enroll and self.enroll.get("save") and (self.log_ok or not PUBLIC):
             out = RECORDINGS / self.user / self.enroll["label"] / f"{time.strftime('%Y%m%d-%H%M%S')}-{self.enroll['n']}.npz"
             out.parent.mkdir(parents=True, exist_ok=True)
             # pixel units already -> width = height = 1 (same layout as ml/extract.py output)
@@ -293,9 +412,12 @@ class Session:
         spots, embs = await asyncio.to_thread(decode)
         ms = round((time.perf_counter() - t0) * 1000)
         self._log_live(pose, lh, rh, lh_p, rh_p, [{"start": s, "end": e, "top": top} for s, e, top in spots])
+        self.seg_id += 1
+        self.segs.append((self.seg_id, {"pose": pose, "lh": lh, "rh": rh, "lh_p": lh_p, "rh_p": rh_p, "fps": fps}))
         for (s, e, top), em in zip(spots, embs):
             self.pending.append(top)
             self.pending_emb.append(em)
+            self.pending_src.append((self.seg_id, int(s), int(e)))
             await self.send(type="sign", top=top, index=len(self.pending) - 1, latency_ms=ms)
         self.changed()
         self.schedule_sentence()
@@ -308,7 +430,7 @@ class Session:
 
     def start_spec(self, cands):
         k = self.spec_key(cands)
-        if not cands or k in self.specs:
+        if not cands or k in self.specs or not self.spark_ok(speculative=True):
             return
         self.specs[k] = asyncio.create_task(muse.build_sentence(
             [list(c) for c in cands], list(self.history), SCENARIOS.get(self.scenario, self.scenario)))
@@ -321,7 +443,7 @@ class Session:
         self.specs = {}
 
     def clear_pending(self):
-        self.pending, self.pending_emb = [], []
+        self.pending, self.pending_emb, self.pending_src = [], [], []
         self.changed()
 
     def schedule_sentence(self):
@@ -345,7 +467,8 @@ class Session:
         if not self.pending:
             return
         spec = self.specs.pop(self.spec_key(self.pending), None)
-        cands, self.pending, self.pending_emb = self.pending, [], []
+        cands, embs, srcs = self.pending, self.pending_emb, self.pending_src
+        self.pending, self.pending_emb, self.pending_src = [], [], []
         self.version += 1
         self.speaking = True
         try:
@@ -360,21 +483,81 @@ class Session:
                 except asyncio.CancelledError:
                     out = None
             if out is None or out.get("_error"):
-                out = await muse.build_sentence(cands, self.history, SCENARIOS.get(self.scenario, self.scenario))
+                if self.spark_ok():
+                    out = await muse.build_sentence(cands, self.history, SCENARIOS.get(self.scenario, self.scenario))
+                else:  # this signer's per-minute limit, or the credit is used up: still say what was signed
+                    out = muse.plain_sentence(cands, "Meta AI limit reached: word by word")
         finally:
             self.speaking = False
         self.drop_specs()  # written for the old conversation history
         self.history.append(f"Deaf person: {out['english']}")
+        self.sid += 1
+        self.sentences[self.sid] = {"cands": cands, "embs": embs, "src": srcs, "english": out.get("english", "")}
+        for k in sorted(self.sentences)[:-20]:  # "that was wrong" works on the last 20 sentences
+            del self.sentences[k]
         # n = how many of the client's pending signs this sentence used (more may have arrived meanwhile);
         # cands = exactly what Muse Spark chose from, so the chat can show where context changed a sign
-        await self.send(type="sentence", n=len(cands), cands=[[{"label": c["label"], "p": round(float(c["p"]), 3)}
-                                                               for c in top] for top in cands], **out)
+        await self.send(type="sentence", n=len(cands), sid=self.sid,
+                        cands=[[{"label": c["label"], "p": round(float(c["p"]), 3)} for c in top] for top in cands],
+                        **out)
+
+    async def on_feedback(self, m):
+        """"That was wrong": what the person really signed, per sign of a spoken sentence, and/or a note.
+        Always saved to data/feedback/<user>.jsonl (they chose to send it); the keypoints of the corrected signs
+        only while "help improve" is on. A corrected sign is also learned privately, like tap-to-correct."""
+        sid = m.get("sid")
+        sent = self.sentences.get(sid) if isinstance(sid, int) else None
+        fixes, learned, files = [], [], []
+        known = self.rec.sign_labels() if self.rec is not None else []
+        for f in (m.get("signs") or [])[:12] if sent else []:
+            try:
+                i, meant = int(f.get("i")), str(f.get("meant", "")).strip()[:60]
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if not meant or not 0 <= i < len(sent["cands"]):
+                continue
+            top = [c["label"] for c in sent["cands"][i]]
+            label = canonical_label(meant, known) if known else meant
+            fixes.append({"i": i, "said": top[0] if top else "", "top": top, "meant": label})
+            if label != (top[0] if top else None) and label in known and sent["embs"][i] is not None:
+                self.rec.add_sample(label, sent["embs"][i])
+                self.rec.samples[label] = self.rec.samples[label][-MAX_PERSONAL:]
+                learned.append(label)
+            src = sent["src"][i] if i < len(sent["src"]) else None
+            seg = next((d for k, d in self.segs if src and k == src[0]), None)
+            if self.log_ok and seg is not None:
+                try:
+                    out = FEEDBACK / self.user / f"{time.strftime('%Y%m%d-%H%M%S')}-{sid}-{i}.npz"
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    np.savez_compressed(out, **{k: v for k, v in seg.items() if k != "fps"}, fps=seg["fps"],
+                                        width=1, height=1, span=np.array(src[1:]), meant=label,
+                                        top=json.dumps(sent["cands"][i]))
+                    files.append(out.name)
+                except Exception as e:
+                    print(f"[feedback {self.user}] keypoints not saved: {e!r}", flush=True)
+        note = str(m.get("note") or "").strip()[:1000]
+        if not fixes and not note:
+            return
+        if learned:
+            self.rec.save(self.user_file())
+            await self.send(type="personal", personal={k: len(v) for k, v in self.rec.samples.items()},
+                            vocab=self.rec.sign_labels())
+        line = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "user": self.user, "scenario": self.scenario,
+                "version": VERSION, "sid": sid if sent else None, "sentence": sent["english"] if sent else None,
+                "signs": [c[0]["label"] if c else "" for c in sent["cands"]] if sent else None, "fixes": fixes,
+                "note": note, "keypoints": files, "device": str(m.get("device") or "")[:200],
+                "history": self.history[-6:]}
+        FEEDBACK.mkdir(parents=True, exist_ok=True)
+        with open(FEEDBACK / f"{self.user}.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line, ensure_ascii=False) + "\n")
+        await self.send(type="feedback_ok", learned=learned, saved_keypoints=len(files))
 
 
 @app.websocket("/ws/sign")
 async def ws_sign(ws: WebSocket):
     await ws.accept()
     s = Session(ws)
+    SESSIONS.add(s)
     rec = recognizer()
     if rec is not None:  # per-connection copy so personal samples don't leak between users
         s.rec = Recognizer.__new__(Recognizer)
@@ -409,6 +592,7 @@ async def ws_sign(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
+        SESSIONS.discard(s)
         if s.timer:
             s.timer.cancel()
         s.drop_specs()
@@ -420,9 +604,10 @@ async def _dispatch(s, m):
     if t == "frame":
         await s.on_frame(m)
     elif t == "hello":
-        s.user = "".join(ch for ch in m.get("user", "guest") if ch.isalnum() or ch in "-_") or "guest"
+        s.user = ("".join(ch for ch in str(m.get("user", "guest")) if ch.isalnum() or ch in "-_") or "guest")[:40]
         s.scenario = m.get("scenario", s.scenario) if m.get("scenario") in SCENARIOS else s.scenario
         s.learn = m.get("mode") == "learn"
+        s.log_ok = m.get("log", True) is not False
         if s.rec is not None:
             s.rec.active = scenario_vocab(s.scenario)
             s.rec.load(s.user_file())
@@ -433,7 +618,8 @@ async def _dispatch(s, m):
                 s.rec.save(s.user_file())
         await s.send(type="ready", model=s.rec is not None,
                      personal={k: len(v) for k, v in (s.rec.samples if s.rec else {}).items()},
-                     vocab=s.rec.sign_labels() if s.rec else [])
+                     vocab=s.rec.sign_labels() if s.rec else [], meta_ai=muse.KEY != "" and muse.budget_left() > 0,
+                     public=PUBLIC, version=VERSION, logging=s.log_ok)
     elif t == "scenario":  # switch scenario without losing the conversation
         if m.get("scenario") in SCENARIOS:
             s.scenario = m["scenario"]
@@ -472,6 +658,8 @@ async def _dispatch(s, m):
         if s.pending:
             s.pending.pop()
             s.pending_emb.pop()
+            if s.pending_src:
+                s.pending_src.pop()
             s.changed()
             if s.pending:
                 s.schedule_sentence()
@@ -497,8 +685,17 @@ async def _dispatch(s, m):
             s.history.append(f"Hearing person: {str(m['text'])[:500]}")
             s.changed()  # a speculative sentence was written without this reply
     elif t == "client_log":  # e.g. the phone's text-to-speech failed: visible in data/server.log
-        print(f"[client {s.user}] {str(m.get('msg'))[:300]}", flush=True)
+        s.client_logs += 1
+        if s.client_logs <= 50:
+            print(f"[client {s.user}] {str(m.get('msg'))[:300]}", flush=True)
+    elif t == "consent":  # "help improve ISL Bridge" switched on / off
+        s.log_ok = bool(m.get("log"))
+    elif t == "feedback":
+        await s.on_feedback(m)
     elif t == "summary":
+        if not s.summaries.ok():
+            await s.send(type="summary", **muse.plain_summary(s.history, "too many summaries - wait a minute"))
+            return
         await s.send(type="summary", **await muse.summarise(s.history, SCENARIOS.get(s.scenario, s.scenario)))
     elif t == "reset":
         s.cancel_timer()
@@ -540,7 +737,10 @@ def _plain_gloss(text, clip_labels):
         if w in lower:
             gloss.append({"sign": lower[w], "dictionary": "", "fingerspell": ""})
         elif w not in dictionary.STOP and len(w) > 2:
-            gloss.append({"sign": "", "dictionary": "", "fingerspell": w.upper()})
+            # an ISLRTC dictionary sign named exactly this word (no "(Maths)"-style qualifier: without Spark
+            # nothing checks the meaning) beats fingerspelling English at a Deaf reader
+            hit = next((h for h in dictionary.search(w, k=3, min_score=97) if h["entry"].lower() == w), None)
+            gloss.append({"sign": "", "dictionary": hit["id"] if hit else "", "fingerspell": "" if hit else w.upper()})
         i += 1
     return {"caption": text, "gloss": gloss, "_latency_ms": 0, "_error": "Muse Spark unavailable, word-by-word"}
 
@@ -600,10 +800,19 @@ async def text_to_sign(text, scenario):
     return g, playlist, round((time.perf_counter() - t0) * 1000)
 
 
+def _too_many(rate, r):
+    if rate.ok(client_ip(r)):
+        return None
+    return JSONResponse({"error": "too many requests from this device - wait a minute and try again"},
+                        status_code=429)
+
+
 @app.post("/api/speech")
-async def speech(audio: UploadFile = File(...), scenario: str = Form("hospital")):
+async def speech(request: Request, audio: UploadFile = File(...), scenario: str = Form("hospital")):
     """Hearing person's speech (16/24 kHz mono WAV) -> transcript -> ISL gloss -> clip playlist."""
-    wav = await audio.read()
+    if (busy := _too_many(RATE_HTTP, request)) is not None:
+        return busy
+    wav = await audio.read(8_000_000)  # ~4 min of 16 kHz audio; hold-to-talk replies are seconds
     t0 = time.perf_counter()
     try:
         asr, asr_ms = await muse.transcribe_wav(wav, keywords=asr_keywords())
@@ -636,6 +845,10 @@ async def ws_speech(ws: WebSocket):
             msg = json.loads(m.get("text") or "{}")
             if msg.get("type") == "start":
                 scenario = msg.get("scenario", scenario)
+                if not RATE_SPEECH.ok(client_ip(ws)):
+                    await ws.send_text(json.dumps({"type": "error", "message": "too many voice replies from this "
+                                                   "device - wait a minute, or type the reply"}))
+                    continue
 
                 async def partial(text):
                     await ws.send_text(json.dumps({"type": "partial", "text": text}, ensure_ascii=False))
@@ -673,8 +886,12 @@ async def ws_speech(ws: WebSocket):
 
 
 @app.post("/api/lens")
-async def lens(body: dict):
+async def lens(request: Request, body: dict):
     """ISL Lens: {"image": data URL of a camera frame} -> object name (Muse Spark vision) -> its ISL sign."""
+    if (busy := _too_many(RATE_LENS, request)) is not None:
+        return busy
+    if not isinstance(body.get("image"), str) or len(body["image"]) > 3_000_000:
+        return JSONResponse({"error": "no image"}, status_code=422)
     clip_labels = {p.stem for p in CLIPS.glob("*.mp4")}
     try:
         o = await muse.identify_object(body["image"], clip_labels)
@@ -701,8 +918,10 @@ async def lens(body: dict):
 
 
 @app.post("/api/text")
-async def text_endpoint(body: dict):
+async def text_endpoint(request: Request, body: dict):
     """Typed text -> ISL clips (doctor can type in a noisy ward; also used for testing). {"text", "scenario"}"""
+    if (busy := _too_many(RATE_HTTP, request)) is not None:
+        return busy
     t0 = time.perf_counter()
     text = str(body.get("text", "")).strip()[:500]
     if not text:
@@ -751,9 +970,19 @@ def recordings(user: str):
     return {p.name: len(list(p.glob("*.npz"))) for p in sorted(d.iterdir())} if d.is_dir() else {}
 
 
+@app.get("/api/health")
+def health():
+    """For monitoring and the end-to-end tests: is the model loaded, which build, how much credit is left."""
+    return {"ok": recognizer() is not None, "version": VERSION, "public": PUBLIC, "sessions": len(SESSIONS),
+            "uptime_s": round(time.time() - STARTED), "meta_ai": bool(muse.KEY) and muse.budget_left() > 0,
+            "log_sync": sync.enabled()}
+
+
 @app.post("/api/compose")
 async def compose(body: dict):
     """Debug: {"candidates": [[{"label","p"}...]...], "history": [], "scenario": "hospital"}"""
+    if PUBLIC:  # an open proxy to Muse Spark on the internet would only spend the credit
+        return JSONResponse({"error": "not available"}, status_code=404)
     return await muse.build_sentence(body["candidates"], body.get("history", []),
                                      SCENARIOS.get(body.get("scenario", "hospital"), "hospital"))
 

@@ -10,8 +10,18 @@ export class WavRecorder {
   private chunks: Float32Array[] = []
 
   async start() {
-    this.stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } })
+    // iPhone Safari starts an AudioContext "suspended" unless it is created (and resumed) inside the tap itself;
+    // after awaiting the microphone permission the tap no longer counts, and no audio would ever arrive
     this.ctx = new AudioContext()
+    void this.ctx.resume().catch(() => {})
+    try {
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } })
+    } catch (e) {
+      void this.ctx.close().catch(() => {})
+      this.ctx = null
+      throw e
+    }
+    if (this.ctx.state === 'suspended') await this.ctx.resume().catch(() => {})
     const src = this.ctx.createMediaStreamSource(this.stream)
     this.node = this.ctx.createScriptProcessor(4096, 1, 1)
     this.chunks = []

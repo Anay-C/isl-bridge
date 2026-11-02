@@ -39,6 +39,7 @@ async def _generate(word, what):
     async with _sem:
         if dst.exists():
             return dst
+        muse.check_budget()
         r = await muse._client.with_options(timeout=60, max_retries=1).images.generate(
             model="muse-image-1.0", prompt=STYLE.format(what=what or word), n=1)
         muse._log_spend("image", 0.01, images=1)
@@ -65,7 +66,8 @@ def common_key(word):
 def ensure(word, what=""):
     """Start drawing `word` in the background if it is not cached yet. Returns its URL either way."""
     s = slug(word)
-    if not exists(word) and muse._client is not None and (s not in _tasks or _tasks[s].done()):
+    if (not exists(word) and muse._client is not None and muse.budget_left() > 0
+            and (s not in _tasks or _tasks[s].done())):
         async def run():
             try:
                 await _generate(word, what)
