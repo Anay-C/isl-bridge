@@ -5,6 +5,24 @@ consistency rules); this file is the current state. Owner: Anay. **Deadline: Thu
 
 ---
 
+## 00000. 3 Nov 09:20 IST: a Wi-Fi outage killed the tester link -> offline-aware watchdog
+The laptop's internet dropped ~09:20-09:28 IST. The old `deploy/share.py` watchdog read "link not answering for
+1 min" as a broken tunnel, killed cloudflared and asked for a new one while offline (DNS failed), and its link
+regex picked `https://api.trycloudflare.com` out of cloudflared's error text and wrote it to `data/share_url.txt`.
+After the internet came back it got a new working link, but the one sent to testers was dead. Fixed:
+- regex skips `api.`; `online()` check (TCP to api.trycloudflare.com:443); while offline the tunnel is kept
+  (cloudflared reconnects itself); a new tunnel only if cloudflared died or the link fails 6 checks (~2 min) with
+  the internet up; a failed start is retried as soon as the internet returns (never crashes the script);
+  server liveness every 2 s; every link given is logged in `data/share_links.log`.
+- `share.py --reload`: rebuild + restart only the server, **same link** (clients reconnect by themselves in 2 s).
+- Simulated-clock tests of the watchdog: scratchpad `t/test_watchdog.py` 13/13. Real check (`t/tunnel_outage.py`):
+  a test tunnel's cloudflared frozen for 5 min -> edge answered 530 throughout, then the SAME link answered again
+  12 s after it resumed. So quick-tunnel links survive outages; replacing the tunnel was the bug.
+- Git Bash `curl` fails for HTTPS on this network (exit 35/28) while Windows and Python clients work: check the
+  link with Python/PowerShell, not curl.
+- Overnight Claude Code reaped its background tasks for low memory: LAN server :8000 (gone), Vite :5173 (process
+  left hung, not serving), iSign access poller (still polling, harmless). Restart :8000/Vite when needed.
+
 ## 0000. Session 3 Nov (00:45-01:45): ready for outside testers — read this first
 Anay: "make it completely end to end, such that we can send it to someone to test". Guide: **`TESTING.md`**.
 Approved: public link, **$50 total Meta cap**, tester logging with notice + opt-out, local commits, delete main.py.

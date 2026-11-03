@@ -16,11 +16,19 @@ Send that link. It works on any phone or laptop with a camera (Chrome, Safari, E
 certificate warning, no app install, no account.
 
 - The link is served **from this laptop** through a Cloudflare quick tunnel (`data/tools/cloudflared.exe`, signed by
-  Cloudflare). Keep the window open and the laptop on, plugged in and online. Closing the lid or a reboot takes the
-  link down; run the script again and you get a **new** link (also written to `data/share_url.txt`).
-- A watchdog restarts the server or the tunnel by itself if one dies (a new tunnel = a new link, printed again).
+  Cloudflare). Keep the window open and the laptop on, plugged in and online. Closing the lid puts the laptop to
+  sleep (link offline until it wakes). After a reboot run the script again: you get a **new** link (also written
+  to `data/share_url.txt`; every link given, with times: `data/share_links.log`).
+- A watchdog keeps it up. A crashed server is back within seconds (same link). If the Wi-Fi drops, testers see a
+  Cloudflare error page (530), and the **same link** works again ~15 s after the internet returns (tested with a
+  5-minute outage), so nothing needs re-sending. Only if cloudflared itself dies, or the link still fails 2 minutes
+  after the internet is back, does it start a new tunnel = a **new link** (printed and written to
+  `data/share_url.txt`). If a tester says the link is dead, look there first.
 - **Stop sharing:** close the window, or double-click **`deploy\stop_share.bat`** (also works when the window is
   hidden, e.g. when it was started for you by Claude Code).
+- **Changed the code? Keep the link:** `.venv-ml/Scripts/python deploy/share.py --reload` rebuilds the web app and
+  restarts only the server (~15 s). Testers' pages reconnect by themselves with their profile; only the
+  conversation context of that moment restarts. Restarting `share.bat` instead would give a new link.
 - It runs a separate public-mode server on `127.0.0.1:8010`. Your own setup (`:8000` + Vite `:5173`) is untouched.
 - Public mode means per-device limits (40 replies/min, 8 Lens photos/min, 40 Spark calls/min per signer),
   debug routes off, and your `anay` profile can't be opened from the link.
