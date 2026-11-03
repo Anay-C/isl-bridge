@@ -5,30 +5,37 @@ How to put ISL Bridge in front of testers, what they see, and how to read what t
 
 ## 1. Share it (Anay)
 
-Double-click **`deploy\share.bat`** (or run `.venv-ml/Scripts/python deploy/share.py`). After ~20 s it prints:
+Double-click **`deploy\share.bat`** (or run `.venv-ml/Scripts/python deploy/share.py`). After ~1 minute it prints:
 
 ```
   ISL Bridge is online for testers:
-      https://<four-random-words>.trycloudflare.com
+      https://anaychauhan-isl-bridge.static.hf.space
 ```
 
-Send that link. It works on any phone or laptop with a camera (Chrome, Safari, Edge), anywhere. No
-certificate warning, no app install, no account.
+**Send testers that fixed address: https://anaychauhan-isl-bridge.static.hf.space.** It never changes. It works on
+any phone or laptop with a camera (Chrome, Safari, Edge), anywhere: no certificate warning, no install, no account.
 
-- The link is served **from this laptop** through a Cloudflare quick tunnel (`data/tools/cloudflared.exe`, signed by
-  Cloudflare). Keep the window open and the laptop on, plugged in and online. Closing the lid puts the laptop to
-  sleep (link offline until it wakes). After a reboot run the script again: you get a **new** link (also written
-  to `data/share_url.txt`; every link given, with times: `data/share_links.log`).
-- A watchdog keeps it up. A crashed server is back within seconds (same link). If the Wi-Fi drops, testers see a
-  Cloudflare error page (530), and the **same link** works again ~15 s after the internet returns (tested with a
-  5-minute outage), so nothing needs re-sending. Only if cloudflared itself dies, or the link still fails 2 minutes
-  after the internet is back, does it start a new tunnel = a **new link** (printed and written to
-  `data/share_url.txt`). If a tester says the link is dead, look there first.
+- **How it works.** The app runs **on this laptop**, reached through a Cloudflare quick tunnel
+  (`data/tools/cloudflared.exe`, signed by Cloudflare) at a random `https://<words>.trycloudflare.com` link. That
+  link changes now and then (below). The fixed address is a free static page on your Hugging Face account (Space
+  `AnayChauhan/isl-bridge`, source in `deploy/forward/`). It checks the app answers, then forwards there, and
+  `share.py` updates it within seconds whenever the link changes. It also keeps each tester's profile id, so a
+  tester keeps their taught signs across link changes. Current link: `data/share_url.txt`. Every link, with times:
+  `data/share_links.log`. What the watchdog did: `data/share.log`.
+- Keep the laptop on, plugged in and online. Closing the lid puts it to sleep (offline until it wakes). After a
+  reboot, double-click `share.bat` again; the fixed address follows by itself.
+- **When the Wi-Fi drops** (4 times on 3 Nov, 6-14 minutes each): the fixed address shows "ISL Bridge is offline
+  for a moment" and keeps retrying by itself. A tester already in the app gets **"Connection lost · Reopen ISL
+  Bridge"** after ~20 s. Tapping it goes through the fixed address back into the app, with the same profile.
+  Drops up to ~12 minutes keep the same link (cloudflared reconnects ~15 s after the internet is back). After a
+  longer drop, Cloudflare deletes the tunnel ("Tunnel not found"), and `share.py` makes a new link at once and
+  puts it behind the fixed address. Tested: tunnel killed -> tester back in the app on the new link in ~90 s,
+  same profile. A crashed server is restarted within seconds (same link).
 - **Stop sharing:** close the window, or double-click **`deploy\stop_share.bat`** (also works when the window is
-  hidden).
-- **Changed the code? Keep the link:** `.venv-ml/Scripts/python deploy/share.py --reload` rebuilds the web app and
-  restarts only the server (~15 s). Testers' pages reconnect by themselves with their profile; only the
-  conversation context of that moment restarts. Restarting `share.bat` instead would give a new link.
+  hidden). The fixed address then shows "offline for a moment".
+- **Changed the code? Keep the link:** `.venv-ml/Scripts/python deploy/share.py --reload` rebuilds the web app,
+  restarts only the server (~15 s) and re-publishes the fixed-address page. Testers' pages reconnect by themselves
+  with their profile; only the conversation context of that moment restarts.
 - It runs a separate public-mode server on `127.0.0.1:8010`. Your own setup (`:8000` + Vite `:5173`) is untouched.
 - Public mode means per-device limits (40 replies/min, 8 Lens photos/min, 40 Spark calls/min per signer),
   debug routes off, and your `anay` profile can't be opened from the link.
@@ -36,13 +43,15 @@ certificate warning, no app install, no account.
   Past it the app keeps working without Meta AI: sentences word by word, replies signed word by word from the
   app's clips and the ISLRTC dictionary, typed replies instead of voice. To be fully safe, also set a spend limit
   on the Meta billing page.
-- A permanent link with the laptop off would need a paid Hugging Face PRO account (Docker Spaces stopped being
+- Running the app with the laptop off would need a paid Hugging Face PRO account (Docker Spaces stopped being
   free). Everything for it is ready: `deploy/build_space.py` (Dockerfile, Space card, private-dataset sync of tester
-  data, see `server/sync.py`). One command once PRO is active. Then lower the laptop cap to $20 (the Space gets $30).
+  data, see `server/sync.py`), deploying to `AnayChauhan/isl-bridge-app`. One command once PRO is active. Then lower
+  the laptop cap to $20 (the Space gets $30), and point the fixed address at the app Space.
 
 Message to send:
-> Please try ISL Bridge, an Indian Sign Language conversation app: <link>. Allow the camera and read the
-> 1-minute intro. Then sign to it, and tap "Wrong?" whenever it gets a sign wrong. Takes 5 minutes.
+> Please try ISL Bridge, an Indian Sign Language conversation app: https://anaychauhan-isl-bridge.static.hf.space.
+> Allow the camera and read the 1-minute intro. Then sign to it, and tap "Wrong?" whenever it gets a sign wrong.
+> Takes 5 minutes.
 
 ## 2. What a tester sees
 
@@ -84,7 +93,10 @@ how many labelled clips were saved. Raw data:
 .venv-ml/Scripts/python ml/test_features.py https://<link>.trycloudflare.com data   # 24 checks over the internet
 .venv-ml/Scripts/python ml/test_features.py http://127.0.0.1:8000                   # your LAN server (20 checks)
 .venv-ml/Scripts/python ml/test_ws.py --url ws://127.0.0.1:8010/ws/sign --clients 6 --fuzz --speed 2 --limit 60
+.venv-ml/Scripts/python deploy/test_share.py                                        # share watchdog, 16 cases, 1 s
 ```
+Check the link from this laptop with Python or PowerShell, not Git Bash `curl`: on this Wi-Fi, curl fails for HTTPS
+(exit 35/28) while browsers, Python and PowerShell work.
 `test_features.py` covers: health, hello/consent, sign → sentence, consent off = nothing logged, "Wrong?" with and
 without keypoints, notes, malformed reports, undo, tap-to-correct, forget, summary, scenario switch, teaching a new
 sign, cancel, Learn-page practice, delete my data, typed reply → ISL, per-device limits (incl. a forged
@@ -92,7 +104,10 @@ X-Forwarded-For), debug route off, and the protected `anay` profile. It uses rea
 Results on 3 Nov: 24/24 through the public link (twice in a row), 20/20 on the LAN server, 21/21 on the Space bundle
 with Meta AI switched off; 6 clients + fuzzing: 0 dropped connections, 0 server errors, 48/60 first signs right.
 Headless-Chrome journeys (scratchpad): welcome → sign → Wrong? → menu → typed reply 12/12 via the link and via
-Vite; hold-to-speak → caption at 0.6 s → signs, plus the Learn page, 6/6.
+Vite; hold-to-speak → caption at 0.6 s → signs, plus the Learn page, 6/6. Later on 3 Nov, after the fixed address:
+24/24 through the new link; link-change journey 9/9 (fixed address → app with a profile id → tunnel killed → "Reopen"
+after 26 s → new link, same profile; a fresh visit meanwhile shows "offline for a moment" and then opens by itself);
+watchdog 16/16; a real tunnel survived a 5-minute outage with the same link.
 
 ## 5. Known limits to tell testers
 
@@ -104,3 +119,6 @@ Vite; hold-to-speak → caption at 0.6 s → signs, plus the Learn page, 6/6.
 - Speech → signs takes 4-10 s (Muse Spark puts it into ISL word order); captions show at once.
 - Not tested on a real iPhone yet (only Chrome/Android-style headless tests). The iPhone microphone start was
   fixed blind (AudioContext created inside the tap).
+- The app runs on Anay's laptop: when its Wi-Fi drops, the app is offline (the fixed address says so and waits).
+  After a link change, testers see the welcome screen once more and make the "Help improve" choice again: to the
+  browser, each new link is a new site. Their profile and taught signs carry over.

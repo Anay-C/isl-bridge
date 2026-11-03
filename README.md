@@ -109,11 +109,12 @@ training communities. That is exactly why personalisation is built in.
 
 ## Try it / share it with testers
 
-Double-click `deploy\share.bat` (or `.venv-ml/Scripts/python deploy/share.py`): it starts a public-mode server and a
-Cloudflare quick tunnel and prints a `https://….trycloudflare.com` link that works on any phone, anywhere, while
-the laptop is on. Testers get a welcome screen with a consent choice, their own private profile, **✏️ Wrong?** under
-every sentence, feedback and *delete my data*. `ml/tester_report.py` summarises what they found. Full guide:
-[TESTING.md](TESTING.md). A hosted version (Hugging Face Space) is packaged in `deploy/build_space.py`.
+**Tester address: https://anaychauhan-isl-bridge.static.hf.space** (works on any phone, anywhere, while the
+laptop is sharing). Double-click `deploy\share.bat` (or `.venv-ml/Scripts/python deploy/share.py`): it starts a
+public-mode server and a Cloudflare quick tunnel, and keeps that fixed Hugging Face address pointing at the tunnel's
+current link, also through Wi-Fi drops. Testers get a welcome screen with a consent choice, their own private profile,
+**✏️ Wrong?** under every sentence, feedback and *delete my data*. `ml/tester_report.py` summarises what they found.
+Full guide: [TESTING.md](TESTING.md). A hosted version (Hugging Face Space) is packaged in `deploy/build_space.py`.
 
 ## Run it
 

@@ -24,7 +24,9 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 STAGE = DATA / "space_build"
 HERE = Path(__file__).resolve().parent / "hf"
-SPACE = os.environ.get("SPACE", "AnayChauhan/isl-bridge")
+# not "isl-bridge": that free static Space is the fixed tester address (deploy/forward/, updated by share.py).
+# Once this app Space runs, point testers at it (or run share.py with --no-forward and edit deploy/forward/).
+SPACE = os.environ.get("SPACE", "AnayChauhan/isl-bridge-app")
 LOG_REPO = os.environ.get("LOG_REPO", "AnayChauhan/isl-bridge-testlogs")
 CAP, BASE = os.environ.get("SPACE_CAP_USD", "50"), os.environ.get("SPACE_BASE_USD", "20")
 

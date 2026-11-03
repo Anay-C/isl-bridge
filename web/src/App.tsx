@@ -33,6 +33,13 @@ function newProfile() {
   localStorageSet('isl-setup-later', null)
   location.href = location.pathname  // drop ?user= so the new id sticks
 }
+// Opened through the fixed tester address (deploy/forward, ?via=): remember it. If this link dies (the laptop's
+// tunnel was replaced), the app offers to reopen through it, which leads to the new link with the same profile.
+function initialHome() {
+  const v = new URLSearchParams(location.search).get('via') ?? ''
+  if (/^https:\/\/[a-z0-9-]+\.static\.hf\.space$/.test(v)) { localStorageSet('isl-home', v); return v }
+  return localStorageGet('isl-home')
+}
 // camera failures in plain words (the raw DOMException names mean nothing to a tester)
 function cameraHelp(e: Error) {
   if (!navigator.mediaDevices) return 'The camera needs a secure (https) link. Open the https:// address.'
@@ -154,6 +161,8 @@ export default function App() {
   const [server, setServer] = useState<{ metaAi: boolean; version: string; public: boolean }>({ metaAi: true, version: '', public: false })
   const [camError, setCamError] = useState('')
   const [camTry, setCamTry] = useState(0)
+  const [home] = useState(initialHome)
+  const [lost, setLost] = useState(false)  // no server connection for 20 s
   const [fix, setFix] = useState<Fix>(null)
   const [noteOpen, setNoteOpen] = useState(false)
   const [note, setNote] = useState('')
@@ -209,11 +218,13 @@ export default function App() {
   useEffect(() => {
     let closed = false
     let retry: ReturnType<typeof setTimeout> | undefined
+    let lostTimer: ReturnType<typeof setTimeout> | undefined
     const connect = () => {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
     const sock = new WebSocket(`${proto}://${location.host}/ws/sign`)
     ws.current = sock
     sock.onopen = () => {
+      clearTimeout(lostTimer); lostTimer = undefined; setLost(false)
       sock.send(JSON.stringify({ type: 'hello', user, scenario: scenarioRef.current, mode: learnMode ? 'learn' : 'talk', log: logRef.current }))
       setPending([])
       setEnroll(null)
@@ -273,11 +284,12 @@ export default function App() {
       setStatus('Reconnecting to server…')
       setComposing(false)
       setSigning(false); signingRef.current = false
+      if (!lostTimer) lostTimer = setTimeout(() => setLost(true), 20000)
       retry = setTimeout(connect, 2000)
     }
     }
     connect()
-    return () => { closed = true; clearTimeout(retry); ws.current?.close() }
+    return () => { closed = true; clearTimeout(retry); clearTimeout(lostTimer); ws.current?.close() }
   }, [user])
 
   // ---- Camera + MediaPipe loop ---------------------------------------------------------------
@@ -611,8 +623,12 @@ export default function App() {
             </div>
           </div>
         )}
-        {camError && !current && source === 'camera' && (
+        {camError && !current && source === 'camera' && !(lost && home) && (
           <button className="cam-retry" onClick={() => { setCamError(''); setStatus('Starting camera…'); setCamTry((n) => n + 1) }}>↻ Retry camera</button>
+        )}
+        {/* the server is gone (its link may have been replaced): retrying here can't work, the fixed address can */}
+        {lost && home && !current && (
+          <button className="cam-retry" onClick={() => { location.href = home }}>Connection lost · ↻ Reopen ISL Bridge</button>
         )}
         {!current && <div className="status">{enroll ? `Teaching “${enroll.label}” — sign it (${enroll.n}/${enroll.reps})` : signing ? (learnMode ? '● Signing…' : '● Signing… lower your hands when you finish') : composing && !learnMode ? '✍️ Writing the sentence…' : status}</div>}
         {!current && !signing && !enroll && talkMode && source === 'camera' && <div className="privacy" title="Hand and body keypoints are computed on this device; only those numbers are sent">🔒 Video stays on this device</div>}
