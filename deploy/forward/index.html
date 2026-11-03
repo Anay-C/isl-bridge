@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ISL Bridge</title>
+<meta name="description" content="Two-way Indian Sign Language conversation app (test version)">
+<style>
+  :root { --bg: #f4f6fb; --card: #ffffff; --fg: #18202e; --muted: #5a6478; --accent: #3554d1; --on-accent: #ffffff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #10141b; --card: #19202a; --fg: #e9edf5; --muted: #a0a9bb; --accent: #8fa3ff; --on-accent: #10141b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px; background: var(--bg);
+         color: var(--fg); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { width: 100%; max-width: 420px; background: var(--card); border-radius: 18px; padding: 28px 22px;
+         text-align: center; box-shadow: 0 2px 18px rgba(0, 0, 0, .08); }
+  .hand { font-size: 44px; line-height: 1; }
+  h1 { font-size: 24px; margin: 10px 0 2px; }
+  p { margin: 8px 0; color: var(--muted); }
+  #status { color: var(--fg); font-weight: 600; min-height: 24px; }
+  .btn { display: inline-block; margin-top: 14px; padding: 12px 24px; border-radius: 999px; background: var(--accent);
+         color: var(--on-accent); font-weight: 600; text-decoration: none; }
+  [hidden] { display: none !important; }
+  .spin { display: inline-block; width: 15px; height: 15px; margin-right: 8px; vertical-align: -2px;
+          border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+          animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+</style>
+</head>
+<body>
+<main>
+  <div class="hand" aria-hidden="true">🤟</div>
+  <h1>ISL Bridge</h1>
+  <p>Two-way Indian Sign Language conversation app (test version)</p>
+  <p id="status" role="status"><span class="spin" aria-hidden="true"></span>Opening…</p>
+  <a id="open" class="btn" href="__LINK__" hidden>Open ISL Bridge</a>
+  <p id="note"></p>
+</main>
+<script>
+// Written by deploy/share.py whenever the test server's address changes. The page checks which address answers
+// (link.json first, it is the newest) and forwards there; if none answers, it waits and retries by itself.
+const EMBEDDED = '__LINK__'
+const SOURCES = ['link.json', 'https://huggingface.co/spaces/__SPACE__/resolve/main/link.json']
+const statusEl = document.getElementById('status')
+const openEl = document.getElementById('open')
+const noteEl = document.getElementById('note')
+const framed = window.top !== window.self  // inside huggingface.co/spaces/...: open the app in its own tab
+
+async function timed(url, ms) {
+  const c = new AbortController()
+  const t = setTimeout(() => c.abort(), ms)
+  try { return await fetch(url, { cache: 'no-store', signal: c.signal }) } finally { clearTimeout(t) }
+}
+
+async function candidates() {
+  const list = []
+  for (const src of SOURCES) {
+    try {
+      const r = await timed(src + '?t=' + Date.now(), 6000)
+      const j = r.ok ? await r.json() : null
+      if (j && /^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/.test(j.url) && !list.includes(j.url)) list.push(j.url)
+    } catch (e) { /* try the next source */ }
+    if (list.length) break
+  }
+  if (EMBEDDED.startsWith('https://') && !list.includes(EMBEDDED)) list.push(EMBEDDED)
+  return list
+}
+
+async function alive(url) {
+  try {
+    const r = await timed(url + '/api/health', 8000)
+    return r.ok && (await r.json()).ok === true
+  } catch (e) { return false }
+}
+
+// The tester's profile id lives HERE (this address never changes) and goes to the app as ?user=, so a tester
+// keeps their taught signs when the app's link changes (each new link is a new site to the browser).
+function testerId() {
+  const asked = new URLSearchParams(location.search).get('user')
+  try {
+    if (asked) { localStorage.setItem('isl-user', asked); return asked }
+    let id = localStorage.getItem('isl-user')
+    if (!id) {
+      const a = crypto.getRandomValues(new Uint8Array(6))
+      id = 't-' + Array.from(a, (x) => '0123456789abcdefghijklmnopqrstuvwxyz'[x % 36]).join('')
+      localStorage.setItem('isl-user', id)
+    }
+    return id
+  } catch (e) { return asked }  // storage blocked (private mode): the app picks an id itself
+}
+
+function target(url) {
+  const q = new URLSearchParams(location.search)
+  const id = testerId()
+  if (id) q.set('user', id)
+  q.set('via', location.origin)  // the app offers "Reopen" (back to here) if its link dies
+  return url + '/?' + q.toString()
+}
+
+async function go() {
+  for (const url of await candidates()) {
+    if (await alive(url)) {
+      openEl.href = target(url)
+      if (framed) {
+        openEl.target = '_blank'
+        openEl.rel = 'noopener'
+        openEl.hidden = false
+        statusEl.textContent = 'Ready.'
+      } else {
+        location.replace(openEl.href)
+      }
+      return
+    }
+  }
+  statusEl.textContent = 'ISL Bridge is offline for a moment.'
+  noteEl.textContent = 'The test server lost its internet connection. This page keeps trying by itself ' +
+    'every 15 seconds and opens the app as soon as it is back, so there is no need to reload.'
+  setTimeout(go, 15000)
+}
+
+go()
+</script>
+</body>
+</html>

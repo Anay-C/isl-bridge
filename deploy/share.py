@@ -11,10 +11,15 @@
 - cloudflared (data/tools/cloudflared.exe, signed by Cloudflare, Inc.) quick tunnel: no account, a random
   https://<words>.trycloudflare.com address that lives as long as this script runs. It is printed and written to
   data/share_url.txt (every link it has given, with times: data/share_links.log).
+- FIXED ADDRESS for testers: https://anaychauhan-isl-bridge.static.hf.space, a free static Hugging Face Space
+  (deploy/forward/) that forwards to the current link. This script updates it whenever the link changes, so
+  testers never need a new link. The page checks the server answers first; while it does not, it waits and
+  retries by itself. Turn off with --no-forward (or ISL_FORWARD_SPACE=).
 - Watchdog: restarts the server within seconds if it dies (same link). If the laptop's internet drops, it keeps
-  the tunnel and waits: cloudflared reconnects by itself when the internet is back. It only starts a new tunnel
-  (= a NEW link, printed again) when cloudflared has died, or when the internet works but the link has still
-  not answered for 2 minutes.
+  the tunnel and waits: cloudflared reconnects by itself, and the link survives drops of ~12 minutes (seen
+  3 Nov). After longer drops Cloudflare deletes the tunnel ("Tunnel not found"); then, or when cloudflared
+  died, or when the internet works but the link has not answered for 2 minutes, it starts a new tunnel (a new
+  link, printed and sent to the fixed address). Its messages: data/share.log.
 - Keep the laptop on, plugged in and online. Its power plan never sleeps on its own (checked 3 Nov 2026), but
   closing the lid usually does (Windows default), which takes the link offline until it wakes up.
 """
@@ -40,10 +45,19 @@ LINKS_LOG = DATA / "share_links.log"
 URL_RE = re.compile(r"https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com")
 CHECK_S = 20            # seconds between checks that the link answers
 NEW_TUNNEL_AFTER = 6    # failed checks while the internet works (~2 min) before giving up on a link
+FORWARD_SPACE = os.environ.get("ISL_FORWARD_SPACE", "AnayChauhan/isl-bridge")  # the fixed address; "" = off
+FORWARD_DIR = ROOT / "deploy" / "forward"
+FWD = None              # Forward, set in main()
 
 
 def log(msg):
-    print(f"[share {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[share {time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    try:  # the window is often hidden (started for Anay by Claude Code): keep a file too
+        with open(DATA / "share.log", "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 def get(url, timeout=8):
@@ -111,11 +125,12 @@ class Server:
 
 class Tunnel:
     def __init__(self, port):
-        self.port, self.p, self.url = port, None, None
+        self.port, self.p, self.url, self.gone = port, None, None, False
 
     def start(self):
         """Start cloudflared; return its link (once it answers, or after ~1.5 min). RuntimeError if no link."""
-        self.url = None
+        self.stop()
+        self.url, self.gone = None, False
         out = open(DATA / "share_tunnel.log", "a", encoding="utf-8")
         self.p = subprocess.Popen([str(CF), "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{self.port}"],
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
@@ -128,6 +143,8 @@ class Tunnel:
                 m = URL_RE.search(line)
                 if m and not self.url:
                     self.url = m.group(0)
+                if "Tunnel not found" in line:  # Cloudflare deleted it during a long outage: this link is gone
+                    self.gone = True
         threading.Thread(target=read, daemon=True).start()
         for _ in range(120):
             if self.url or self.p.poll() is not None:
@@ -142,24 +159,93 @@ class Tunnel:
             time.sleep(2)
         return self.url
 
-    def alive(self):
+    def running(self):
         return self.p is not None and self.p.poll() is None
 
+    def alive(self):
+        return self.running() and not self.gone
+
     def stop(self):
-        if self.alive():
+        if self.running():
             self.p.terminate()
+
+
+class Forward:
+    """The fixed address testers get: a free static Hugging Face Space (deploy/forward/) that forwards to the
+    current link. Pushed in the background whenever the link changes, retried until it succeeds."""
+
+    def __init__(self, space):
+        from dotenv import dotenv_values
+        from huggingface_hub import HfApi
+        token = os.environ.get("HF_TOKEN") or dotenv_values(ROOT / ".env").get("HF_TOKEN")
+        if not token:
+            raise RuntimeError("no HF_TOKEN in .env")
+        self.space, self.api = space, HfApi(token=token)
+        self.api.create_repo(space, repo_type="space", space_sdk="static", exist_ok=True)  # free (no hardware)
+        self.address = self.api.space_info(space).host or \
+            f"https://{space.replace('/', '-').lower()}.static.hf.space"
+        self.pending, self.busy, self.lock = None, False, threading.Lock()
+
+    def update(self, link):
+        with self.lock:
+            self.pending = link
+            if not self.busy:
+                self.busy = True
+                threading.Thread(target=self._push, daemon=True).start()
+
+    def _push(self):
+        from huggingface_hub import CommitOperationAdd
+        while True:
+            with self.lock:
+                link = self.pending
+            now = time.strftime("%Y-%m-%d %H:%M (UTC%z)")
+            files = {
+                "index.html": (FORWARD_DIR / "index.html").read_text(encoding="utf-8")
+                .replace("__LINK__", link).replace("__SPACE__", self.space),
+                "README.md": (FORWARD_DIR / "README.md").read_text(encoding="utf-8").replace("__UPDATED__", now),
+                "link.json": json.dumps({"url": link, "updated": now}),
+            }
+            try:
+                self.api.create_commit(self.space, repo_type="space", commit_message=f"Forward to {link}",
+                                       operations=[CommitOperationAdd(path_in_repo=k, path_or_fileobj=v.encode())
+                                                   for k, v in files.items()])
+            except Exception as e:  # offline, or Hugging Face hiccup: keep trying
+                log(f"could not update the fixed address yet ({type(e).__name__}: {str(e)[:120]}) - retrying in 30 s")
+                time.sleep(30)
+                continue
+            with self.lock:
+                if self.pending == link:
+                    self.pending, self.busy = None, False
+                    log(f"the fixed address {self.address} now opens {link}")
+                    return
+
+    def wait(self, timeout=90):
+        """True once the latest update is on Hugging Face."""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            with self.lock:
+                if not self.busy:
+                    return True
+            time.sleep(1)
+        return False
 
 
 def announce(url):
     URL_FILE.write_text(url + "\n", encoding="utf-8")
     with open(LINKS_LOG, "a", encoding="utf-8") as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {url}\n")
+    log(f"new link: {url}")
+    if FWD:
+        FWD.update(url)
+    send = FWD.address if FWD else url
     bar = "=" * 72
-    print(f"\n{bar}\n  ISL Bridge is online for testers:\n\n      {url}\n\n"
-          f"  Open it on a phone (Chrome / Safari) or a laptop with a camera. Message to send:\n"
-          f"  \"Please try ISL Bridge, an Indian Sign Language conversation app: {url}\n"
+    print(f"\n{bar}\n  ISL Bridge is online for testers:\n\n      {send}\n\n"
+          + (f"  (a fixed address: it forwards to today's link {url},\n"
+             f"   and keeps working when that link changes)\n\n" if FWD else "")
+          + f"  Open it on a phone (Chrome / Safari) or a laptop with a camera. Message to send:\n"
+          f"  \"Please try ISL Bridge, an Indian Sign Language conversation app: {send}\n"
           f"   Allow the camera, read the 1-minute intro, then sign and tap 'Wrong?' when it gets a sign wrong.\"\n"
-          f"  (also saved in data/share_url.txt; reports: data/feedback/, summary: ml/tester_report.py)\n"
+          f"  (link also in data/share_url.txt; reports: data/feedback/, summary: ml/tester_report.py)\n"
           f"  Stop sharing: close this window, or double-click deploy\\stop_share.bat\n{bar}\n", flush=True)
 
 
@@ -197,7 +283,8 @@ def watch(srv, tun):
             continue
         last = time.time()
         if not tun.alive():
-            log("cloudflared stopped - starting a new tunnel (the link changes)")
+            log("Cloudflare deleted the tunnel (a long internet outage) - starting a new one (the link changes)"
+                if tun.running() else "cloudflared stopped - starting a new tunnel (the link changes)")
             open_tunnel(tun)
             fails, offline = 0, False
         elif get(f"{tun.url}/api/health", timeout=15) == 200:
@@ -220,8 +307,9 @@ def watch(srv, tun):
                 fails, offline = 0, False
 
 
-def reload(port, build):
-    """New code, same link: rebuild the web app, stop only the server; the running watchdog restarts it."""
+def reload(port, build, forward=True):
+    """New code, same link: rebuild the web app, stop only the server; the running watchdog restarts it.
+    Also re-publishes the fixed-address page (deploy/forward/) in case it changed."""
     url = URL_FILE.read_text(encoding="utf-8").strip() if URL_FILE.exists() else ""
     local = f"http://127.0.0.1:{port}"
     if not url or not health(local):
@@ -239,6 +327,14 @@ def reload(port, build):
             seen = health(url, timeout=15)
             log(f"reloaded: version {h.get('version')}; the link is unchanged: {url}"
                 + ("" if seen else " (it did not answer from here just now - check again in a minute)"))
+            if forward and FORWARD_SPACE:
+                try:
+                    fwd = Forward(FORWARD_SPACE)
+                    fwd.update(url)
+                    if not fwd.wait():
+                        log("could not re-publish the fixed-address page (it still forwards to this link)")
+                except Exception as e:
+                    log(f"fixed-address page not re-published ({type(e).__name__}: {str(e)[:120]})")
             return
         time.sleep(2)
     sys.exit("the server did not come back within 2 minutes - see data/share_server.log")
@@ -265,6 +361,7 @@ def main():
     ap.add_argument("--port", type=int, default=8010)
     ap.add_argument("--device", default=os.environ.get("ISL_DEVICE", "cpu"))
     ap.add_argument("--no-build", action="store_true")
+    ap.add_argument("--no-forward", action="store_true", help="don't update the fixed Hugging Face address")
     ap.add_argument("--reload", action="store_true",
                     help="restart only the server of a running share with the current code (the link stays)")
     ap.add_argument("--stop", action="store_true", help="stop a running share (server + tunnel) and exit")
@@ -272,12 +369,19 @@ def main():
     if a.stop:
         return stop(a.port)
     if a.reload:
-        return reload(a.port, build=not a.no_build)
+        return reload(a.port, build=not a.no_build, forward=not a.no_forward)
     if not CF.exists():
         sys.exit(f"missing {CF}: download cloudflared-windows-amd64.exe from "
                  "https://github.com/cloudflare/cloudflared/releases and save it there")
     if not a.no_build:
         build_web()
+    global FWD
+    if FORWARD_SPACE and not a.no_forward:
+        try:
+            FWD = Forward(FORWARD_SPACE)
+            log(f"fixed address for testers: {FWD.address}")
+        except Exception as e:  # no token / offline / Hugging Face refused: share the plain link instead
+            log(f"no fixed address this time ({type(e).__name__}: {str(e)[:160]}) - testers need the link itself")
     srv, tun = Server(a.port, a.device), Tunnel(a.port)
     srv.start()
     open_tunnel(tun)

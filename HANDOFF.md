@@ -5,6 +5,23 @@ consistency rules); this file is the current state. Owner: Anay. **Deadline: Thu
 
 ---
 
+## 000000. 3 Nov 17:00 IST: fixed tester address https://anaychauhan-isl-bridge.static.hf.space
+A 14-minute Wi-Fi drop at 10:40 IST made Cloudflare delete the quick tunnel ("Unauthorized: Tunnel not found" on
+reconnect; a 12-minute drop at 13:39 survived), so the link changed again. Anay approved a fixed address: a free
+**static** HF Space `AnayChauhan/isl-bridge` (no hardware, created without the PRO paywall) from `deploy/forward/`.
+- `index.html` reads `link.json` (same origin, cache-busted), checks `<link>/api/health` (now CORS `*`, no-store),
+  forwards with `?user=<id kept in ITS localStorage>&via=<its origin>`; if nothing answers: "offline for a
+  moment", retry every 15 s. In the HF wrapper iframe it shows a button instead (top navigation is blocked).
+- `share.py`: `Forward` pushes index.html + README + link.json in one commit whenever the link changes (retries
+  every 30 s while offline), `--reload` re-publishes it, `--no-forward` / `ISL_FORWARD_SPACE=` turn it off;
+  "Tunnel not found" -> new tunnel within ~20 s; its own log: `data/share.log`.
+- App: `?via=` (only `https://*.static.hf.space`) is remembered; after 20 s without the server it shows
+  "Connection lost · Reopen ISL Bridge" (over a camera error too: models come from the dead server).
+- `build_space.py` now targets `AnayChauhan/isl-bridge-app` (the forward page owns `isl-bridge`).
+- Tests: watchdog `deploy/test_share.py` 16/16; scratchpad `t/test_forward.py` 9/9 (link change: Reopen after 26 s,
+  back in the app on the new link with the same profile ~90 s after the kill); `ml/test_features.py` 24/24.
+- Limit: after a link change the welcome/consent screen shows again (new origin = empty localStorage).
+
 ## 00000. 3 Nov 09:20 IST: a Wi-Fi outage killed the tester link -> offline-aware watchdog
 The laptop's internet dropped ~09:20-09:28 IST. The old `deploy/share.py` watchdog read "link not answering for
 1 min" as a broken tunnel, killed cloudflared and asked for a new one while offline (DNS failed), and its link
@@ -17,7 +34,8 @@ After the internet came back it got a new working link, but the one sent to test
 - `share.py --reload`: rebuild + restart only the server, **same link** (clients reconnect by themselves in 2 s).
 - Simulated-clock tests of the watchdog: scratchpad `t/test_watchdog.py` 13/13. Real check (`t/tunnel_outage.py`):
   a test tunnel's cloudflared frozen for 5 min -> edge answered 530 throughout, then the SAME link answered again
-  12 s after it resumed. So quick-tunnel links survive outages; replacing the tunnel was the bug.
+  12 s after it resumed. So quick-tunnel links survive short outages (5 and 12 min seen), and replacing the
+  tunnel was the bug; a 14-minute outage later that day did delete one (see the section above).
 - Git Bash `curl` fails for HTTPS on this network (exit 35/28) while Windows and Python clients work: check the
   link with Python/PowerShell, not curl.
 - Overnight Claude Code reaped its background tasks for low memory: LAN server :8000 (gone), Vite :5173 (process

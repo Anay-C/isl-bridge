@@ -1013,10 +1013,13 @@ def recordings(user: str):
 
 @app.get("/api/health")
 def health():
-    """For monitoring and the end-to-end tests: is the model loaded, which build, how much credit is left."""
-    return {"ok": recognizer() is not None, "version": VERSION, "public": PUBLIC, "sessions": len(SESSIONS),
-            "uptime_s": round(time.time() - STARTED), "meta_ai": bool(muse.KEY) and muse.budget_left() > 0,
-            "log_sync": sync.enabled()}
+    """For monitoring and the end-to-end tests: is the model loaded, which build, how much credit is left.
+    Readable from any origin: the fixed tester address (deploy/forward, a Hugging Face page) checks the link is up
+    before forwarding a tester to it."""
+    return JSONResponse({"ok": recognizer() is not None, "version": VERSION, "public": PUBLIC,
+                         "sessions": len(SESSIONS), "uptime_s": round(time.time() - STARTED),
+                         "meta_ai": bool(muse.KEY) and muse.budget_left() > 0, "log_sync": sync.enabled()},
+                        headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-store"})
 
 
 @app.post("/api/compose")
