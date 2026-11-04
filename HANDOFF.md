@@ -5,6 +5,23 @@ consistency rules); this file is the current state. Owner: Anay. **Deadline: Thu
 
 ---
 
+## 0000000. 4 Nov 14:05 IST: guided teaching (word on screen -> ghost shows it -> you sign it)
+Anay asked: show the words to teach one at a time on screen, with a ghost doing the sign first, then the person
+signs. `web/src/Teach.tsx` (+ App.tsx wiring; the old report sheet and quick-setup queue are gone):
+- Phases per word: watch (big mirrored ghost over a dimmed camera, plays twice, "I'm ready" skips) -> ready (turn
+  starts when the hands are down, at most 2 s) -> sign (5 reps, dots, small looping ghost = "watch again") -> saving
+  -> done (✓ 1.4 s, next word) or check (self-test < kept-1: teach again / keep) -> finished (summary; signing
+  closes it). Skip, Stop, tap a chip to jump; Quick setup continues with the words not taught (< 3 samples).
+- Frames are sent as "nobody there" except in sign / finished, so copying along with the ghost never counts.
+  The server gets `enroll` when the word opens (reconnect: sent again, reps restart).
+- Server: a stretch whose last END_GAP frames have no pose (muted frames, too-close gate, person left) is dropped
+  (it had become rep 1 when teaching started mid-sign). `Session.stop_enroll()`: Stop / Skip / a new enroll put the
+  sign's earlier samples back (before, a half-taught word replaced a good one at the next save).
+- `ISL_WEB_DIST=<folder>` serves another web build (tested beside the live app on :8020).
+- Tests: `ml/test_features.py` 25/25 through the public link; scratchpad `t/test_teach.py` 24/25 (the miss: first
+  load > 20 s over the tunnel; 31 s to Ready on a fresh browser at 14:10 IST). Deployed: `share.py --reload`,
+  version 0c2fc6c-1104-1403, same link.
+
 ## 000000. 3 Nov 17:00 IST: fixed tester address https://anaychauhan-isl-bridge.static.hf.space
 A 14-minute Wi-Fi drop at 10:40 IST made Cloudflare delete the quick tunnel ("Unauthorized: Tunnel not found" on
 reconnect; a 12-minute drop at 13:39 survived), so the link changed again. Anay approved a fixed address: a free

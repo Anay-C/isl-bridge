@@ -66,7 +66,12 @@ Message to send:
    4-10 s), or type ⌨️. A reply that could not be signed says so; tapping it retries.
 5. **☰ menu / ⓘ:** How to test, 💬 Send feedback, Help improve (on/off), profile id, *start fresh*, *delete my
    data* (removes their profile, keypoints and reports from the laptop at once).
-6. 🎓 **Learn** (ghost coach) for testers who don't know ISL yet.
+6. **✋ Teach / ⚡ Quick setup (guided, 4 Nov):** the words come one at a time, big on the camera view. A ghost shows
+   each sign twice ("copy it like a mirror"; nothing counts meanwhile), then the tester signs it 5 times, lowering
+   the hands after each (rep dots fill up, a small ghost keeps looping in the corner, the how-to steps are below).
+   Learned -> ✓ and the next word by itself; reps too different -> "teach it again" or "keep it". Skip, Stop
+   (continue later: Quick setup then offers only the words left), or tap any word to jump to it.
+7. 🎓 **Learn** (ghost coach) for testers who don't know ISL yet.
 
 Good things to ask testers to try: single words (HELLO, DOCTOR, WATER, PAIN), a short sentence (I · PAIN ·
 HEAD), ✋ Teach one of their own signs and use it, a spoken reply, the visit summary (📋).
@@ -90,7 +95,7 @@ how many labelled clips were saved. Raw data:
 ## 4. Automated end-to-end checks (run before sending a new link)
 
 ```
-.venv-ml/Scripts/python ml/test_features.py https://<link>.trycloudflare.com data   # 24 checks over the internet
+.venv-ml/Scripts/python ml/test_features.py https://<link>.trycloudflare.com data   # 25 checks over the internet
 .venv-ml/Scripts/python ml/test_features.py http://127.0.0.1:8000                   # your LAN server (20 checks)
 .venv-ml/Scripts/python ml/test_ws.py --url ws://127.0.0.1:8010/ws/sign --clients 6 --fuzz --speed 2 --limit 60
 .venv-ml/Scripts/python deploy/test_share.py                                        # share watchdog, 16 cases, 1 s
@@ -107,7 +112,12 @@ Headless-Chrome journeys (scratchpad): welcome → sign → Wrong? → menu → 
 Vite; hold-to-speak → caption at 0.6 s → signs, plus the Learn page, 6/6. Later on 3 Nov, after the fixed address:
 24/24 through the new link; link-change journey 9/9 (fixed address → app with a profile id → tunnel killed → "Reopen"
 after 26 s → new link, same profile; a fresh visit meanwhile shows "offline for a moment" and then opens by itself);
-watchdog 16/16; a real tunnel survived a 5-minute outage with the same link.
+watchdog 16/16; a real tunnel survived a 5-minute outage with the same link. 4 Nov, guided teaching: 25/25 through
+the public link (new: a teach stopped half-way keeps the sign's earlier reps); headless-Chrome teaching journey
+(scratchpad `t/test_teach.py`: quick setup -> ghost plays with no reps counted -> 5 reps -> ✓ / "varied" -> next word
+-> skip -> stop -> continue (only the words left) -> single word -> new sign without a ghost -> last word -> summary)
+24/25 through the public link; the miss was the first load taking >20 s (models over the laptop's upload: 31 s to
+"Ready" on a fresh browser at 14:10 IST, 12.7 s the day before).
 
 ## 5. Known limits to tell testers
 
