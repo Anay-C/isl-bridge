@@ -154,7 +154,7 @@ tasks disabled (not deleted; that project is over).
 ---
 
 ## 00. Session 1 Nov (evening)
-New files: `README.md` (judges), `SUBMISSION.md` (form text), `DEMO_SCRIPT.md` (2-min shot list),
+New files: `README.md` (judges), `SUBMISSION.md` (form text),
 `server/pictures.py`, `ml/cutout_boxes.py`. Source backup before this session: `%TEMP%/claude_bak/src-20261101-183104/`.
 
 **Bugs found + fixed (measured):**
@@ -200,7 +200,7 @@ sentence words; s1 61.8/64.7, 65.8; s2 52.9/70.6, 57.9; ensemble(3) 61.8/76.5, 6
 
 **Done in the background:** SAM cut-outs finished — all 227 clips have a cut-out + crop box (boxes.json is re-read
 by the server when it changes). Meta spend ≈ $10.70 of $150. **To do:** Anay: re-teach Help, Quick setup on the
-demo phone, rehearse with DEMO_SCRIPT.md, record. Ideas not started: eyebrow (non-manual) question detection,
+demo phone, rehearse, record. Ideas not started: eyebrow (non-manual) question detection,
 fingerspelling. Folder still not a git repo (only init/commit when Anay says so).
 
 **Late evening, after Anay's "it doesn't detect any of the signs" test (phone):**
