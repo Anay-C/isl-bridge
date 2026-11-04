@@ -205,7 +205,13 @@ export default function App() {
     const c = chatRef.current
     if (!c || !(turns.length || live)) return
     // a turn grows after it is added (sentence, sign chips, pictures), so scroll again once it has settled
-    const go = () => c.scrollTo({ top: c.scrollHeight, behavior: 'smooth' })
+    // scroll to the TOP of the newest bubble (clamped at the end), so on a small phone screen the sentence itself
+    // shows first rather than the bottom of a tall bubble
+    const go = () => {
+      const bs = c.querySelectorAll('.bubble'), b = bs[bs.length - 1] as HTMLElement | undefined
+      const top = b ? b.getBoundingClientRect().top - c.getBoundingClientRect().top + c.scrollTop - 4 : c.scrollHeight
+      c.scrollTo({ top, behavior: 'smooth' })
+    }
     go()
     const t1 = setTimeout(go, 250), t2 = setTimeout(go, 1000)
     return () => { clearTimeout(t1); clearTimeout(t2) }
