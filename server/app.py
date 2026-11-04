@@ -6,6 +6,7 @@ WebSocket /ws/sign  (client -> server JSON)
     {"type":"hello", "user":"anay", "scenario":"hospital"}
     {"type":"frame", "w":640, "h":480, "pose":[132 floats]|null, "lh":[63]|null, "rh":[63]|null}
     {"type":"enroll", "label":"Pain", "reps":5}   next N signs become personal samples
+    {"type":"cancel_enroll"}   stop teaching half-way: the sign's earlier samples are put back
     {"type":"undo"} | {"type":"speak_now"} | {"type":"reset"}
     {"type":"feedback", "sid":3, "signs":[{"i":0,"meant":"Pain"}], "note":"..."}   "that was wrong"
     {"type":"consent", "log":false}   stop saving this person's sign keypoints
@@ -303,6 +304,15 @@ class Session:
     def user_file(self):
         return USERS / f"{self.user}.json"
 
+    def stop_enroll(self):
+        """Teaching stopped half-way (Stop, Skip, another word): put back the samples the profile had for the sign.
+        A few unchecked reps must not replace a taught sign (they were not saved yet, but the next save would)."""
+        e, self.enroll = self.enroll, None
+        if e and self.rec is not None and e.get("personalise", True):
+            self.rec.clear_samples(e["label"])
+            if e.get("before"):
+                self.rec.samples[e["label"]] = list(e["before"])
+
     async def on_frame(self, m):
         t = m.get("t")
         now = time.perf_counter()
@@ -321,6 +331,11 @@ class Session:
         frame = {"pose": _arr(m.get("pose"), (33, 4), w, h), "lh": _arr(m.get("lh"), (21, 3), w, h),
                  "rh": _arr(m.get("rh"), (21, 3), w, h), "w": w, "h": h}
         seg = self.seg.push(frame, fps=self.fps())
+        if seg and all(f["pose"] is None for f in seg[-segmenter.END_GAP:]):
+            # cut off by the body vanishing, not by the hands going down: the phone stopped sending keypoints (the
+            # teaching ghost started playing, "too close" gate) or the person left the picture. A fragment of a
+            # sign: never a guess, never a teaching rep (e.g. a conversation sign still open when teaching starts).
+            seg = None
         if self.seg.signing != self.signing:
             self.signing = self.seg.signing
             await self.send(type="state", signing=self.signing)
@@ -667,12 +682,14 @@ async def _dispatch(s, m):
         label = str(m.get("label", "")).strip()[:40]
         if not label:
             return
+        s.stop_enroll()  # another word while one was being taught (guided teaching sends cancel_enroll first)
         if s.rec is not None:
             label = canonical_label(label, s.rec.classes + list(s.rec.samples))
+        before = list(s.rec.samples.get(label, [])) if s.rec is not None else []
         if s.rec is not None and m.get("restart"):
             s.rec.clear_samples(label)
         s.enroll = {"label": label, "reps": max(1, min(30, int(m.get("reps", 5)))), "n": 0,
-                    "save": bool(m.get("save")), "personalise": m.get("personalise", True)}
+                    "save": bool(m.get("save")), "personalise": m.get("personalise", True), "before": before}
         s.cancel_timer()
         s.clear_pending()
         await s.send(type="enroll_progress", label=s.enroll["label"], n=0, reps=s.enroll["reps"])
@@ -681,7 +698,7 @@ async def _dispatch(s, m):
         s.cancel_timer()
         s.clear_pending()
     elif t == "cancel_enroll":
-        s.enroll = None
+        s.stop_enroll()
         s.quiet_until = time.perf_counter() + 1.5
     elif t == "forget":
         if s.rec is not None:
@@ -1039,6 +1056,6 @@ dictionary.CACHE.mkdir(parents=True, exist_ok=True)
 app.mount("/clips_dict", StaticFiles(directory=dictionary.CACHE), name="clips_dict")
 pictures.CACHE.mkdir(parents=True, exist_ok=True)
 app.mount("/pictures", StaticFiles(directory=pictures.CACHE), name="pictures")
-DIST = ROOT / "web" / "dist"
+DIST = Path(os.environ.get("ISL_WEB_DIST") or ROOT / "web" / "dist")  # another build, e.g. to test one beside the live app
 if DIST.exists():
     app.mount("/", StaticFiles(directory=DIST, html=True), name="web")

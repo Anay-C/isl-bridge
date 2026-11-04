@@ -25,7 +25,8 @@ A phone web app plus a server.
   every clip, so they stand inside the patient's camera view, with captions. Words that have no familiar sign
   (X-ray, inhaler, after food) get a picture card drawn by Muse Image.
 - **Personalisation.** "Teach a sign" takes 5 repetitions: your own variant of a word, or a brand-new sign such as
-  your name or your medicine. Tap-to-correct also teaches. Stored privately per user, never used to train the
+  your name or your medicine. It is guided: each word appears big on screen, a ghost signer shows it, then you sign
+  it (Quick setup walks through 20 hospital words this way, about 8 minutes). Tap-to-correct also teaches. Stored privately per user, never used to train the
   shared model. A trust rule keeps a mis-cut repetition from hijacking common signs.
 - **For the visit**: a bilingual visit summary for the doctor (with "please confirm" items), SOS (alert + WhatsApp
   location), Ghost Coach to learn signs (a ghost skeleton on your own body, stars and tips), ISL Lens (show an

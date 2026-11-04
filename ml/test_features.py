@@ -194,6 +194,18 @@ async def main():
         d = await c.wait("enroll_done", since=n0, timeout=12)
         prog = [m["n"] for m in c.msgs[n0:] if m.get("type") == "enroll_progress"]
         check("teach a new sign -> done", d is not None and prog[-1:] == [3], f"progress {prog} self-test {d and d.get('self_test')}/{d and d.get('kept')}")
+
+        # teaching it again but stopping half-way (guided teaching: Skip / Stop) keeps the sign as it was
+        await c.send(type="enroll", label="Insulin", reps=3, restart=True)
+        await c.sign(MEDICINE[4 % len(MEDICINE)], speed=4.0)
+        await asyncio.sleep(0.5)
+        await c.send(type="cancel_enroll")
+        n0 = len(c.msgs)
+        await c.send(type="scenario", scenario="general")
+        p = await c.wait("personal", since=n0)
+        kept = d and d.get("kept")
+        check("teaching stopped half-way -> the sign's earlier reps are back", p is not None and p["personal"].get("Insulin") == kept,
+              f"{p and p['personal'].get('Insulin')} reps (taught: {kept})")
         await c.send(type="forget", label="Insulin")
 
         # cancel_enroll, then conversation still works
