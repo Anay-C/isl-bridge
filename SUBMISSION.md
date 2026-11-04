@@ -72,17 +72,17 @@ Leave it empty, or: We didn't use Fireworks, Modal or Baseten; everything ran on
 - **Description** (fix the chapter times to your final edit; each chapter must be at least 10 s):
 
 ```
-Sign to it and it speaks; speak to it and a real signer answers inside your camera view. ISL Bridge is a two-way Indian Sign Language conversation app for hospitals, built for the Meta Global AI Developer Hackathon 2026 (Indie track). In this demo I play both the patient and the doctor.
+Sign to it and it speaks; speak to it and a real signer answers inside your camera view. ISL Bridge is a two-way Indian Sign Language conversation app for hospitals, built for the Meta Global AI Developer Hackathon 2026 (Indie track). In this demo I sign the patient's part; the doctor speaks off camera.
 
 Code: https://github.com/Anay-C/isl-bridge
 
 0:00 Intro
-0:31 Sign → speech
-0:52 Speech → sign
-1:22 It learns your signing
-1:45 More features
-1:59 How it works
-2:17 Results
+0:34 Sign → speech
+0:55 Speech → sign
+1:27 It learns your signing
+1:50 More features
+2:04 How it works
+2:22 Results
 
 Built with Meta Muse Spark, Muse Voice Transcribe, SAM 3.1, Muse Image and PyTorch, plus Google MediaPipe.
 Sign data: INCLUDE (AI4Bharat) and the signers of St. Louis School for the Deaf, Adyar; ISLRTC dictionary; CISLR (IIT Kanpur); ISL-CSLTR.
