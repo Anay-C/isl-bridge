@@ -7,7 +7,8 @@ showing the people. Keep captions on. Total 2:00.
 ## Before recording (15 min, once)
 1. Server + web running; open the app on the demo device; tap once (turns the voice on).
 2. ☰ / header → scenario **🏥 Hospital**, language EN (switch to हिं for one sentence).
-3. **Re-teach your signs**: ✋ Teach → ⚡ Quick setup (20 hospital words × 5 reps, ~10 min). Delete the old "Help"
+3. **Re-teach your signs**: ✋ Teach → ⚡ Quick setup (20 hospital words × 5 reps, ~8-10 min; each word comes up
+   on screen, the ghost shows it twice, then you sign it 5 times, lowering your hands after each). Delete the old "Help"
    first (✋ Teach → My signs → ✕) — it contained two stray reps.
 4. Type each planned doctor reply once (⌨️) so its dictionary clips and pictures are cached (no waiting on camera).
 5. Framing: upper body + both hands in view with space around them; plain background; good light from the front.

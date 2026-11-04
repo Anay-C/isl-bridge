@@ -35,7 +35,7 @@ ISL Bridge is designed around those facts:
 | 🎤→🤟 | **Speech → sign**: the hearing person holds the mic | **Muse Voice Transcribe** (realtime, live captions, EN/HI code-switching) → **Muse Spark** rewrites into ISL order (time-topic-comment, question word last) and searches the ISLRTC dictionary with **tool calling** → playlist of sign clips |
 | 🧍 | **AR interpreter**: the signer stands inside your camera view | **SAM 3.1** video segmentation cut the human signer out of every sign clip |
 | 🖼️ | **Picture cards** for X-ray, injection, syrup, inhaler... | **Muse Image** draws a simple pictogram once per concept; Spark decides which words need one |
-| ✋ | **Teach a sign** (5 reps): your own variant, or a brand-new sign (your name, your medicine) | Personal prototypes on the model's embedding sphere; private to your profile |
+| ✋ | **Teach a sign** (5 reps), guided: the word appears big on screen, a ghost shows the sign, then you sign it. ⚡ Quick setup walks through 20 hospital words one at a time. Also brand-new signs (your name, your medicine) | Personal prototypes on the model's embedding sphere; private to your profile. Keypoints are not sent while the ghost plays, so copying along never counts |
 | 👆 | **Tap to correct**: tap the right alternative and the app learns it | Adds a private sample |
 | 📋 | **Visit summary** for the doctor in English + Devanagari Hindi, with "please confirm" items | Muse Spark (structured output) |
 | 🆘 | **SOS**: EMERGENCY / AMBULANCE / POLICE, or HELP + PAIN → full-screen alert + WhatsApp location | Never sends anything by itself |

@@ -1,11 +1,17 @@
-// Ghost signer (Talk mode, 👻): the hearing person's reply is signed by a solid, bright ghost figure drawn
-// from the reference recordings (same body-space trajectories as the Learn page's ghost, /api/coach/<sign>),
-// instead of playing the video clip. Drawn as a signer FACING the viewer (like the clip, not mirrored), at
-// full strength on a dimmed camera so it is easy to read. Frames are interpolated for smooth motion.
+// Ghost signer: a solid, bright figure drawn from the reference recordings (body-space trajectories,
+// /api/coach/<sign>, the same ones the Learn page's ghost uses). Frames are interpolated for smooth motion.
+// - Talk mode (👻): the hearing person's reply is signed by the ghost FACING the viewer (like the clip, not
+//   mirrored), at full strength on a dimmed camera so it is easy to read.
+// - Teaching (Teach.tsx): `mirror` draws it as a mirror image of the learner's selfie view, so the ghost's hand
+//   and the learner's own hand move on the same side of the screen ("copy it like a mirror"); `loop` repeats it.
 import { useEffect, useRef } from 'react'
 import { HAND_EDGES } from './vision'
 
-export type GhostRef = { fps: number; frames: { arm: number[][]; lh: number[][] | null; rh: number[][] | null }[] }
+export type HowTo = { steps: string[]; tip: string; confidence: 'high' | 'medium' | 'low' }
+export type GhostRef = {
+  fps: number; frames: { arm: number[][]; lh: number[][] | null; rh: number[][] | null }[]
+  howto?: HowTo | null  // steps written by Muse Spark from the video (ml/describe_signs.py)
+}
 
 const ARM_EDGES = [[0, 1], [0, 2], [2, 4], [1, 3], [3, 5]]  // shoulders, elbows, wrists
 export const GHOST_SPEED = 0.85  // a little slower than the recording: easier to read
@@ -41,12 +47,14 @@ export const ghostMs = (g: GhostRef) => (g.frames.length / g.fps / GHOST_SPEED) 
 const lerp = (a: number[][] | null, b: number[][] | null, t: number) =>
   !a ? null : !b ? a : a.map((q, i) => [q[0] + (b[i][0] - q[0]) * t, q[1] + (b[i][1] - q[1]) * t])
 
-export default function Ghost({ g, label, caption }: { g: GhostRef | null; label: string; caption: string }) {
+type Props = { g: GhostRef | null; label?: string; caption?: string; loop?: boolean; mirror?: boolean; className?: string }
+export default function Ghost({ g, label, caption, loop = false, mirror = false, className = 'ghost-stage' }: Props) {
   const ref = useRef<HTMLCanvasElement>(null)
   useEffect(() => {
     const c = ref.current
     if (!c || !g) return
     const t0 = performance.now()
+    const cycle = ghostMs(g)
     let raf = 0
     const frame = () => {
       const dpr = window.devicePixelRatio || 1
@@ -54,7 +62,8 @@ export default function Ghost({ g, label, caption }: { g: GhostRef | null; label
       if (c.width !== W || c.height !== H) { c.width = W; c.height = H }
       const ctx = c.getContext('2d')!
       ctx.clearRect(0, 0, W, H)
-      const pos = Math.min(g.frames.length - 1, ((performance.now() - t0) / 1000) * g.fps * GHOST_SPEED)
+      const ms = loop ? (performance.now() - t0) % cycle : performance.now() - t0
+      const pos = Math.min(g.frames.length - 1, (ms / 1000) * g.fps * GHOST_SPEED)
       const i = Math.floor(pos), t = pos - i
       const a = g.frames[i], b = g.frames[Math.min(i + 1, g.frames.length - 1)]
       const arm = lerp(a.arm, b.arm, t)!
@@ -66,7 +75,8 @@ export default function Ghost({ g, label, caption }: { g: GhostRef | null; label
       // x -0.9..0.8 and y -0.9..2.3 (99%); nose at y -0.58 (median), head top ~-1.0. Fit x -1.2..1.2, y -1.1..2.45.
       const sc = Math.min(W / 2.4, H / 3.6)
       const cx = W / 2, cy = H / 2 - 0.67 * sc
-      const pt = (q: number[]) => [cx + q[0] * sc, cy + q[1] * sc]
+      const sx = mirror ? -1 : 1
+      const pt = (q: number[]) => [cx + sx * q[0] * sc, cy + q[1] * sc]
       ctx.lineCap = 'round'
       ctx.lineJoin = 'round'
       // head + torso, so the hands read against a body
@@ -106,12 +116,12 @@ export default function Ghost({ g, label, caption }: { g: GhostRef | null; label
     }
     frame()
     return () => cancelAnimationFrame(raf)
-  }, [g])
+  }, [g, loop, mirror])
   return (
-    <div className="ghost-stage">
+    <div className={className}>
       <canvas ref={ref} />
-      <div className="clip-label">{label}</div>
-      <div className="caption">{caption}</div>
+      {label && <div className="clip-label">{label}</div>}
+      {caption && <div className="caption">{caption}</div>}
     </div>
   )
 }

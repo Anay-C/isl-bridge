@@ -6,6 +6,7 @@ import Record from './Record'
 import Learn, { type Overlay, type PracticeResult } from './Learn'
 import Cutout from './Cutout'
 import Ghost, { ghostMs, loadGhost, type GhostRef } from './Ghost'
+import { DEMO_PLAYS, TEACHING, TeachCard, TeachStage, handsUp, type Guide } from './Teach'
 
 type Cand = { label: string; p: number }
 // cands: the top-3 per sign that Muse Spark chose from; chosen: what it picked (shows context corrections);
@@ -51,9 +52,11 @@ function cameraHelp(e: Error) {
 }
 type Clip = { sign?: string; clip?: string; cutout?: string; cutout_box?: number[]; fingerspell?: string; dictionary?: boolean; picture?: string }
 type Enroll = { label: string; n: number; reps: number } | null
-type Report = { label: string; kept: number; dropped: number; self_test: number; confused_with: string[] }
 const TEACH_REPS = 5
-// Quick setup: the words a hospital demo needs most. Teaching each 5x makes the app learn YOUR way of signing.
+// when teaching ends, a leftover "Learned …" status goes back to the normal prompt (errors stay)
+const afterTeaching = (st: string) => (st.startsWith('Learned') ? 'Ready — sign to the camera' : st)
+// Quick setup: the words a hospital demo needs most. Teaching each 5x makes the app learn YOUR way of signing
+// (guided one word at a time: the ghost shows it, then the person signs it, see Teach.tsx).
 const QUICK_WORDS = ['Hello', 'Thank you', 'I', 'you', 'Pain', 'Head', 'Stomach', 'Fever', 'Doctor', 'Medicine',
   'Help', 'Water', 'Yes', 'No', 'Please', 'Today', 'Yesterday', 'Where', 'What', 'Emergency']
 type Summary = {
@@ -145,10 +148,13 @@ export default function App() {
     send({ type: 'client_log', msg: `speech failed: ${error} | ${navigator.userAgent}` })
     setVoiceBlocked({ text })
   })
-  const [queue, setQueue] = useState<string[]>([])  // quick-setup words still to teach
-  const queueRef = useRef<string[]>([])
-  queueRef.current = queue
-  const startEnrollRef = useRef<(l: string) => void>(() => {})
+  // guided teaching (Teach.tsx). The ref is the source of truth for the WebSocket and camera-loop callbacks.
+  const [guide, setGuide] = useState<Guide | null>(null)
+  const guideRef = useRef<Guide | null>(null)
+  const putGuide = (g: Guide | null) => { guideRef.current = g; setGuide(g) }
+  const downFrames = useRef(0)  // 'ready': camera frames in a row with the hands down
+  const readyAt = useRef(0)  // when 'ready' began: hands that never drop (seated, forearms on a table) start after 2 s
+  const armRef = useRef<() => void>(() => {})
   const [turns, setTurns] = useState<Turn[]>([])
   const [lang, setLang] = useState<'en' | 'hi'>('en')
   const [scenario, setScenario] = useState('hospital')
@@ -173,7 +179,6 @@ export default function App() {
   const [teachOpen, setTeachOpen] = useState(false)
   const [teachLabel, setTeachLabel] = useState('')
   const [personal, setPersonal] = useState<Record<string, number>>({})
-  const [report, setReport] = useState<Report | null>(null)
   const [sos, setSos] = useState<'offer' | 'alert' | null>(null)
   const [summary, setSummary] = useState<Summary | 'loading' | null>(null)
   const [typeOpen, setTypeOpen] = useState(false)
@@ -228,6 +233,14 @@ export default function App() {
       sock.send(JSON.stringify({ type: 'hello', user, scenario: scenarioRef.current, mode: learnMode ? 'learn' : 'talk', log: logRef.current }))
       setPending([])
       setEnroll(null)
+      // reconnected while teaching: the new session starts the current word again (reps so far were not saved)
+      const g = guideRef.current
+      if (g && TEACHING.includes(g.phase)) {
+        sock.send(JSON.stringify({ type: 'enroll', label: g.words[g.i], reps: TEACH_REPS, restart: true }))
+        downFrames.current = 0
+        readyAt.current = performance.now()
+        putGuide({ ...g, label: null, n: 0, phase: g.phase === 'watch' ? 'watch' : 'ready' })
+      }
       setStatus((st) => (st === 'Disconnected from server' || st.startsWith('Reconnecting') ? 'Ready — sign to the camera' : st))
     }
     sock.onmessage = (ev) => {
@@ -249,16 +262,19 @@ export default function App() {
       else if (m.type === 'personal') { setPersonal(m.personal); setVocab(m.vocab) }
       else if (m.type === 'enroll_done') {
         setPersonal((p) => ({ ...p, [m.label]: m.kept }))
-        const q = queueRef.current
-        if (q.length && m.self_test >= m.kept - 1) {  // quick setup: learned well, go straight to the next word
-          setStatus(`Learned “${m.label}” ✓ — next: “${q[0]}”`)
-          setQueue(q.slice(1))
-          setTimeout(() => startEnrollRef.current(q[0]), 1200)
-        } else setReport(m)
+        // guided teaching: learned well -> a short ✓, then the next word; weak self-test -> teach again or keep
+        const g = guideRef.current
+        if (g && TEACHING.includes(g.phase) && m.label === g.label) {
+          const ok = m.self_test >= m.kept - 1
+          putGuide({ ...g, phase: ok ? 'done' : 'check', report: m, results: { ...g.results, [g.words[g.i]]: ok ? 'ok' : 'weak' } })
+        }
       }
       else if (m.type === 'interim') { if (signingRef.current) setInterim(m.signs) }
       else if (m.type === 'composing') setComposing(true)
-      else if (m.type === 'state') { setSigning(m.signing); signingRef.current = m.signing; if (!m.signing) setInterim([]); else setComposing(false) }
+      else if (m.type === 'state') {
+        setSigning(m.signing); signingRef.current = m.signing; if (!m.signing) setInterim([]); else setComposing(false)
+        if (m.signing && guideRef.current?.phase === 'finished') { putGuide(null); setStatus(afterTeaching) }  // they started talking: show the conversation
+      }
       else if (m.type === 'sign' && learnMode) { /* Learn page only reacts to practice results */ }
       else if (m.type === 'sign') {
         setInterim([])
@@ -277,6 +293,15 @@ export default function App() {
       } else if (m.type === 'enroll_progress') {
         setEnroll(m.n >= m.reps ? null : m)
         if (m.n >= m.reps) { setVocab((v) => (v.includes(m.label) ? v : [...v, m.label])); setStatus(`Learned “${m.label}” ✓`) }
+        const g = guideRef.current
+        if (g && TEACHING.includes(g.phase)) {
+          // n = 0 starts the word (and names it, e.g. "me" -> "I"); a late rep of a word left behind is ignored
+          if (m.n === 0) putGuide({ ...g, label: m.label, n: 0 })
+          else if (m.label === g.label && m.n > g.n) {
+            try { navigator.vibrate?.(m.n >= m.reps ? [40, 60, 40] : 40) } catch { /* no vibration */ }
+            putGuide({ ...g, n: m.n, phase: m.n >= m.reps ? 'saving' : g.phase })
+          }
+        }
       } else if (m.type === 'error') setStatus(m.message)
     }
     sock.onclose = () => {
@@ -335,8 +360,17 @@ export default function App() {
         const r = fresh ? detect(v) : null
         if (r) framing.current = checkFraming(r.raw, v, framing.current, setFrameHint, setFrameBlock, source === 'camera')
         if (r) {
-          // too close to read the signs: send "nobody there" so no guesses are made from fragments of a sign
-          send(framing.current.block ? { type: 'frame', w: r.frame.w, h: r.frame.h, t: r.frame.t, pose: null, lh: null, rh: null } : { type: 'frame', ...r.frame })
+          // teaching: the person's turn starts once the hands are down, so a sign copied along with the ghost
+          // never becomes a half rep
+          const g = guideRef.current
+          if (g?.phase === 'ready') {
+            downFrames.current = handsUp(r.raw, v.videoWidth, v.videoHeight) ? 0 : downFrames.current + 1
+            if (downFrames.current >= 3 || performance.now() - readyAt.current > 2000) armRef.current()
+          }
+          // too close to read the signs, or teaching but not the person's turn (the ghost is playing): send
+          // "nobody there" so no guesses are made from fragments of a sign and copying along is not counted
+          const mute = framing.current.block || (g !== null && g.phase !== 'sign' && g.phase !== 'finished')
+          send(mute ? { type: 'frame', w: r.frame.w, h: r.frame.h, t: r.frame.t, pose: null, lh: null, rh: null } : { type: 'frame', ...r.frame })
           const c = canvas.current!
           if (c.width !== v.videoWidth) { c.width = v.videoWidth; c.height = v.videoHeight }
           const ctx = c.getContext('2d')!
@@ -509,22 +543,87 @@ export default function App() {
   const loaded = ghost && ghost.idx === clipIdx && ghost.sign === current?.sign ? ghost : undefined
   const ghostNow = ghostable(current) && loaded?.g !== null ? { g: loaded?.g ?? null } : null
 
-  const startEnroll = (label: string) => {
-    if (!label.trim()) return
-    send({ type: 'enroll', label: label.trim(), reps: TEACH_REPS, restart: true })
+  // ---- Guided teaching: one word at a time; the ghost shows it, then the person signs it TEACH_REPS times ----
+  // The server counts reps from the moment a word opens, but the camera frames stay muted until it is the
+  // person's turn (phase 'sign'). Skipping or stopping half-way: the server puts the sign's old samples back.
+  const openWord = (g: Guide, i: number) => {
+    downFrames.current = 0
+    send({ type: 'enroll', label: g.words[i], reps: TEACH_REPS, restart: true })  // not connected: sent on reconnect
+    putGuide({ ...g, i, phase: 'watch', label: null, n: 0, report: undefined, watched: 0 })
+  }
+  const startGuide = (words: string[]) => {
+    const list = [...new Set(words.map((w) => w.trim()).filter(Boolean))]
+    if (!list.length) return
+    if (guideRef.current && TEACHING.includes(guideRef.current.phase)) send({ type: 'cancel_enroll' })
     setPending([])  // the server drops unspoken signs when teaching starts
-    setReport(null)
     setTeachOpen(false)
     setTeachLabel('')
+    stopPlayback()
+    openWord({ words: list, i: 0, phase: 'watch', label: null, n: 0, results: {}, watched: 0 }, 0)
   }
+  const leaveWord = () => {  // stopped half-way: the server restores what the profile had for the sign
+    const g = guideRef.current
+    if (g && TEACHING.includes(g.phase)) send({ type: 'cancel_enroll' })
+  }
+  const closeGuide = () => { putGuide(null); setEnroll(null); setStatus(afterTeaching) }
+  const stopGuide = () => { leaveWord(); closeGuide() }
+  const nextWord = () => {
+    const g = guideRef.current
+    if (!g) return
+    leaveWord()
+    if (g.i + 1 < g.words.length) { openWord(g, g.i + 1); return }
+    if (g.words.length > 1) { putGuide({ ...g, phase: 'finished' }); return }
+    closeGuide()
+    const w = pretty(g.label ?? g.words[0])
+    const r = g.results[g.words[0]]
+    if (r === 'ok') setToast(`Learned “${w}” ✓ It now reads your way of signing it.`)
+    else if (r === 'weak') setToast(`Saved “${w}”. If it still misreads it, teach it again from ✋ Teach.`)
+  }
+  const jumpTo = (i: number) => { const g = guideRef.current; if (g) { leaveWord(); openWord(g, i) } }
+  const teachAgain = () => { const g = guideRef.current; if (g) openWord(g, g.i) }
+  const showAgain = () => {
+    const g = guideRef.current
+    if (g && (g.phase === 'ready' || g.phase === 'sign')) putGuide({ ...g, phase: 'watch', watched: g.watched + 1 })
+  }
+  const toReady = () => {
+    const g = guideRef.current
+    if (g?.phase === 'watch') { downFrames.current = 0; readyAt.current = performance.now(); putGuide({ ...g, phase: 'ready' }) }
+  }
+  armRef.current = () => {  // hands are down: the person's turn, reps count from now
+    const g = guideRef.current
+    if (g?.phase === 'ready') putGuide({ ...g, phase: 'sign' })
+  }
+  // the ghost of the current word (undefined while loading, null = no recording: sign it your way)
+  const guideWord = guide ? guide.words[guide.i] : ''
+  const [demo, setDemo] = useState<{ word: string; g: GhostRef | null } | null>(null)
+  useEffect(() => {
+    if (!guideWord) return
+    let live = true
+    loadGhost(guideWord).then((g) => { if (live) setDemo({ word: guideWord, g }) })
+    const g = guideRef.current
+    const after = g?.words[g.i + 1]
+    if (after) loadGhost(after)  // ready before it is needed
+    return () => { live = false }
+  }, [guideWord])
+  const demoNow = demo && demo.word === guideWord ? demo.g : undefined
+  // the ghost plays DEMO_PLAYS times, then it is the person's turn
+  useEffect(() => {
+    if (guide?.phase !== 'watch' || demoNow === undefined) return
+    const t = setTimeout(toReady, demoNow ? DEMO_PLAYS * ghostMs(demoNow) : 0)
+    return () => clearTimeout(t)
+  }, [guide?.phase, guide?.i, guide?.watched, demoNow])
+  // learned: a short ✓, then the next word (saving: the self-test normally comes back within milliseconds)
+  useEffect(() => {
+    if (guide?.phase !== 'done' && guide?.phase !== 'saving') return
+    const t = setTimeout(nextWord, guide.phase === 'done' ? 1400 : 6000)
+    return () => clearTimeout(t)
+  }, [guide?.phase, guide?.i])
 
-  startEnrollRef.current = startEnroll
   const quickWords = QUICK_WORDS.filter((w) => vocab.includes(w))
-  const quickSetup = () => {
-    if (!quickWords.length) return
-    setQueue(quickWords.slice(1))
-    startEnroll(quickWords[0])
-  }
+  const quickLeft = quickWords.filter((w) => (personal[w] ?? 0) < 3)  // not taught yet (a correction adds 1)
+  const quickLabel = quickLeft.length && quickLeft.length < quickWords.length
+    ? `⚡ Continue quick setup (${quickLeft.length} words left)` : `⚡ Quick setup: the ${quickWords.length} key hospital words`
+  const quickSetup = () => { if (quickWords.length) startGuide(quickLeft.length ? quickLeft : quickWords) }
 
   const shareLocation = () => {
     const open = (extra: string) => window.open(`https://wa.me/?text=${encodeURIComponent(SOS_TEXT.en + ' ' + SOS_TEXT.hi + extra)}`, '_blank')
@@ -603,13 +702,13 @@ export default function App() {
       <section className={`stage ${signing ? 'live' : ''} ${source === 'camera' && cams.length > 1 ? 'has-cams' : ''}`}>
         <video ref={video} playsInline muted className={source === 'camera' ? (mirror ? 'mirror' : '') : 'contain'} />
         <canvas ref={canvas} className={`${source === 'camera' ? (mirror ? 'mirror' : '') : 'contain'} overlay`} />
-        {source === 'camera' && cams.length > 1 && !current && (
+        {source === 'camera' && cams.length > 1 && !current && !guide && (
           <select className="cam-select" aria-label="Choose camera" value={activeCam}
             onChange={(e) => { setCamId(e.target.value); localStorageSet('isl-cam', e.target.value) }}>
             {cams.map((c, i) => <option key={c.deviceId || i} value={c.deviceId}>📷 {camName(c, i)}</option>)}
           </select>
         )}
-        {frameHint && !current && !frameBlock && <div className="frame-hint" role="status">{frameHint}</div>}
+        {frameHint && !current && !frameBlock && !guide && <div className="frame-hint" role="status">{frameHint}</div>}
         {frameBlock && !current && (
           <div className="frame-gate" role="alert">
             <svg className="silhouette" viewBox="0 0 120 160" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
@@ -630,17 +729,20 @@ export default function App() {
         {lost && home && !current && (
           <button className="cam-retry" onClick={() => { location.href = home }}>Connection lost · ↻ Reopen ISL Bridge</button>
         )}
-        {!current && <div className="status">{enroll ? `Teaching “${enroll.label}” — sign it (${enroll.n}/${enroll.reps})` : signing ? (learnMode ? '● Signing…' : '● Signing… lower your hands when you finish') : composing && !learnMode ? '✍️ Writing the sentence…' : status}</div>}
-        {!current && !signing && !enroll && talkMode && source === 'camera' && <div className="privacy" title="Hand and body keypoints are computed on this device; only those numbers are sent">🔒 Video stays on this device</div>}
-        {enroll && <div className="enroll-bar"><div style={{ width: `${(enroll.n / enroll.reps) * 100}%` }} /></div>}
-        {enroll && clips.includes(enroll.label) && (
+        {!current && !guide && <div className="status">{enroll ? `Teaching “${enroll.label}” — sign it (${enroll.n}/${enroll.reps})` : signing ? (learnMode ? '● Signing…' : '● Signing… lower your hands when you finish') : composing && !learnMode ? '✍️ Writing the sentence…' : status}</div>}
+        {!current && !signing && !enroll && !guide && talkMode && source === 'camera' && <div className="privacy" title="Hand and body keypoints are computed on this device; only those numbers are sent">🔒 Video stays on this device</div>}
+        {enroll && !guide && <div className="enroll-bar"><div style={{ width: `${(enroll.n / enroll.reps) * 100}%` }} /></div>}
+        {enroll && !guide && clips.includes(enroll.label) && (
           <video className="teach-ref" key={enroll.label} src={`/clips/${encodeURIComponent(enroll.label)}.mp4`} autoPlay loop muted playsInline />
         )}
-        {enroll && !recordMode && (
+        {enroll && !guide && !recordMode && (
           <div className="teach-actions">
-            {queue.length > 0 && <small>{queue.length} more after this</small>}
-            <button className="ghost" onClick={() => { send({ type: 'cancel_enroll' }); setEnroll(null); setQueue([]) }}>Stop</button>
+            <button className="ghost" onClick={() => { send({ type: 'cancel_enroll' }); setEnroll(null) }}>Stop</button>
           </div>
+        )}
+        {guide && !current && (
+          <TeachStage guide={guide} demo={demoNow} mirror={mirror} signing={signing} reps={TEACH_REPS} hint={frameBlock ? '' : frameHint}
+            blocked={frameBlock} pretty={pretty} onReady={toReady} onShowAgain={showAgain} />
         )}
         {interim.length > 0 && !enroll && !learnMode && !current && <div className="interim">{interim.map(pretty).join(' · ')}…</div>}
         {current && ghostNow && <Ghost key={clipIdx} g={ghostNow.g} label={pretty(current.sign ?? '')} caption={caption} />}
@@ -678,7 +780,16 @@ export default function App() {
         {recordMode && <Record user={user} enroll={enroll} send={send} />}
         {learnMode && clips.length > 0 && <Learn clips={clips} result={practice} send={send} overlay={overlay} pretty={pretty} capture={captureFrame} />}
 
-        {talkMode && pending.length > 0 && (
+        {talkMode && guide && (
+          <section className="chat" aria-label="Teaching">
+            <TeachCard guide={guide} howto={demoNow?.howto} hasDemo={!!demoNow} reps={TEACH_REPS} pretty={pretty}
+              onShowAgain={showAgain} onSkip={nextWord} onStop={stopGuide} onAgain={teachAgain} onNext={nextWord}
+              onClose={closeGuide} onJump={jumpTo} />
+            {credit}
+          </section>
+        )}
+
+        {talkMode && !guide && pending.length > 0 && (
           <section className="pending" aria-label="Signs read so far">
             {pending.map((c, i) => (
               <div key={i} className="cand">
@@ -695,15 +806,16 @@ export default function App() {
           </section>
         )}
 
-        {talkMode && (
+        {talkMode && !guide && (
           <section className="chat" ref={chatRef} aria-live="polite">
             {!setupLater && Object.keys(personal).length < 5 && quickWords.length > 0 && turns.length < 2 && !enroll && (
               <div className="setup-card">
                 <b>✋ Teach ISL Bridge your signing first</b>
-                <span>Everyone signs a little differently, and a new phone only knows other people's way. Sign the {quickWords.length} key
-                  hospital words 5 times each (about 8 minutes) and it will read <i>your</i> signs. Stays private in your profile.</span>
+                <span>Everyone signs a little differently, and a new phone only knows other people's way. The {quickWords.length} key
+                  hospital words come one at a time: a ghost shows each sign, then you sign it 5 times (about 8 minutes).
+                  After that it reads <i>your</i> signs. Stays private in your profile.</span>
                 <div className="row">
-                  <button className="primary" onClick={quickSetup}>⚡ Start quick setup</button>
+                  <button className="primary" onClick={quickSetup}>{quickLeft.length && quickLeft.length < quickWords.length ? `⚡ Continue (${quickLeft.length} words left)` : '⚡ Start quick setup'}</button>
                   <button className="ghost" onClick={() => { setSetupLater(true); localStorageSet('isl-setup-later', '1') }}>Later</button>
                 </div>
               </div>
@@ -739,7 +851,7 @@ export default function App() {
         )}
         {!talkMode && credit}
 
-        {talkMode && (
+        {talkMode && !guide && (
           <footer className="controls">
             <button className="ctl" onClick={() => setTeachOpen(true)}><span aria-hidden="true">✋</span><small>Teach</small></button>
             {server.metaAi ? (
@@ -767,7 +879,7 @@ export default function App() {
               <li><b>Sign, then lower your hands.</b> One word or a short sentence, e.g. <i>HELLO</i>, <i>DOCTOR</i>, <i>PAIN · HEAD</i>. The phone speaks it.</li>
               <li><b>Wrong?</b> Tap <b>✏️ Wrong?</b> under the sentence and fix the words. It learns your signing, and we see what failed.</li>
               <li><b>Reply:</b> the hearing person holds <b>🎤</b> and talks (English or Hindi), or types ⌨️. The words come back as ISL signs.</li>
-              <li>Don't know ISL? <b>🎓 Learn</b> shows each sign to copy. <b>✋ Teach</b> makes the app learn your own way of signing a word.</li>
+              <li><b>✋ Teach</b> makes the app learn your own signing: a ghost shows each word, then you sign it 5 times. Don't know ISL? <b>🎓 Learn</b> has every sign to practise.</li>
             </ol>
             <label className="consent">
               <input type="checkbox" checked={logOk} onChange={(e) => setLogOk(e.target.checked)} />
@@ -897,40 +1009,25 @@ export default function App() {
         <div className="sheet" onClick={() => setTeachOpen(false)}>
           <div className="sheet-body" onClick={(e) => e.stopPropagation()}>
             <h3>Teach the app your sign</h3>
-            <p>Sign it {TEACH_REPS} times, lowering your hands (or holding still) after each one. Works for your own way of signing a word, or brand-new signs like your name or your medicine.</p>
-            {quickWords.length > 0 && <button onClick={() => { setTeachOpen(false); quickSetup() }}>⚡ Quick setup: teach the {quickWords.length} key hospital words</button>}
+            <p>A ghost shows the sign, then you sign it {TEACH_REPS} times, lowering your hands (or holding still) after each one.
+              Works for your own way of signing a word, or brand-new signs like your name or your medicine (no ghost for those: sign it your way).</p>
+            {quickWords.length > 0 && <button onClick={quickSetup}>{quickLabel}</button>}
             <p className="private">🔒 Saved only to your profile. It is never used to train the shared model.</p>
             {Object.keys(personal).length > 0 && (
               <div className="my-signs">
                 <h4>My signs</h4>
                 {Object.entries(personal).map(([l, n]) => (
                   <span key={l} className="my-sign">{pretty(l)} <small>{n}×</small>
-                    <button className="ghost" title="Re-teach" onClick={() => startEnroll(l)}>↻</button>
+                    <button className="ghost" title="Re-teach" onClick={() => startGuide([l])}>↻</button>
                     <button className="ghost" title="Delete" onClick={() => send({ type: 'forget', label: l })}>✕</button>
                   </span>
                 ))}
               </div>
             )}
             <input placeholder="New sign, e.g. Insulin, Priya" value={teachLabel} onChange={(e) => setTeachLabel(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && startEnroll(teachLabel)} />
-            <button onClick={() => startEnroll(teachLabel)}>Start</button>
-            <div className="chips">{vocab.map((v) => <button key={v} onClick={() => startEnroll(v)}>{pretty(v)}</button>)}</div>
-          </div>
-        </div>
-      )}
-      {report && (
-        <div className="sheet" onClick={() => setReport(null)}>
-          <div className="sheet-body" onClick={(e) => e.stopPropagation()}>
-            <h3>{report.self_test >= report.kept - 1 ? '✓' : '⚠'} Learned “{pretty(report.label)}”</h3>
-            <p>Self-test: <b>{report.self_test}/{report.kept}</b> of your reps recognised correctly
-              {report.dropped > 0 && <> · {report.dropped} shaky {report.dropped === 1 ? 'rep' : 'reps'} left out</>}.</p>
-            {report.confused_with.length > 0 && (
-              <p>Sometimes looks like <b>{report.confused_with.map(pretty).join(', ')}</b>. Try signing it more distinctly, or re-teach.</p>
-            )}
-            {queue.length > 0
-              ? <button onClick={() => { setReport(null); startEnroll(queue[0]); setQueue(queue.slice(1)) }}>Next: {pretty(queue[0])} →</button>
-              : <button onClick={() => setReport(null)}>Done</button>}
-            <button className="secondary" onClick={() => startEnroll(report.label)}>Re-teach</button>
+              onKeyDown={(e) => e.key === 'Enter' && startGuide([teachLabel])} />
+            <button onClick={() => startGuide([teachLabel])}>Start</button>
+            <div className="chips">{vocab.map((v) => <button key={v} onClick={() => startGuide([v])}>{pretty(v)}</button>)}</div>
           </div>
         </div>
       )}
