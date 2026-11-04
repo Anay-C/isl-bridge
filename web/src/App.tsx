@@ -203,8 +203,13 @@ export default function App() {
   const chatRef = useRef<HTMLElement>(null)
   useEffect(() => {
     const c = chatRef.current
-    if (c && (turns.length || live)) c.scrollTo({ top: c.scrollHeight, behavior: 'smooth' })
-  }, [turns.length, live])
+    if (!c || !(turns.length || live)) return
+    // a turn grows after it is added (sentence, sign chips, pictures), so scroll again once it has settled
+    const go = () => c.scrollTo({ top: c.scrollHeight, behavior: 'smooth' })
+    go()
+    const t1 = setTimeout(go, 250), t2 = setTimeout(go, 1000)
+    return () => { clearTimeout(t1); clearTimeout(t2) }
+  }, [turns, live])
   const langRef = useRef(lang)
   langRef.current = lang
 
