@@ -10,6 +10,9 @@ Built for the Meta Global AI Developer Hackathon 2026 (Indie track) by Anay Chau
 > Pitch it honestly: ISL Bridge recognises **202 everyday and hospital signs**, reads whole signed sentences, and
 > learns **your** way of signing a word from a few repetitions. It is not a general ISL translator (yet).
 
+**Live demo: https://anaychauhan-isl-bridge.static.hf.space** (any phone or laptop with a camera). It is served
+from the developer's laptop, so it can occasionally be offline; [Run it](#run-it) starts it on your own machine.
+
 ---
 
 ## Why
@@ -101,7 +104,7 @@ those numbers are sent. Taught signs are stored per user and never used to train
 | **Context** (937 signed turns, real recogniser noise, judged blind) | meaning preserved **64.0 % → 74.6 %** with Muse Spark + conversation (+10.6 pts, 95 % CI +7.5…+13.7); Spark *without* context: 50.4 % |
 | Ghost Coach stars on held-out clips | correct sign → 3★ in 95 %; wrong sign → 1★ in 98 % |
 | Latency | sign recognised 0.2–0.7 s after hands down; sentence spoken 0.5–3 s after; speech → ISL ~4 s after release |
-| Cost | ~$0.001 per signed sentence; ~$10 of Meta API spend for the whole project including all SAM cut-outs |
+| Cost | ~$0.001 per signed sentence; ~$11 of Meta API spend for the whole project including all SAM cut-outs |
 
 Caveats we state up front: the unseen-signer sets are small; the context eval uses synthetic dialogues judged by
 Muse Spark; ISL varies by region, so accuracy on a new person depends on how close their variant is to the
@@ -126,7 +129,7 @@ cd web && npm install && npx vite --host        # https://localhost:5173 (phone:
 `.env` needs `MODEL_API_KEY` (Meta Model API). Optional: `ISL_DEVICE=cuda` (GPU inference),
 `ISL_MODEL=a.pt,b.pt,c.pt` (ensemble). Pages: `/` conversation, `/?learn` Ghost Coach, `/?record` data collection.
 
-End-to-end regression: `ml/test_features.py <url>` (24 checks over the real WebSocket + HTTP, incl. consent,
+End-to-end regression: `ml/test_features.py <url>` (25 checks over the real WebSocket + HTTP, incl. consent,
 reports, limits). Evaluations: `ml/test_signs.py` (every sign, held-out clips, live server path, per-sign report),
 `ml/test_ws.py` (every sign streamed over the real WebSocket, fuzzed), `ml/eval_live.py` (unseen signers, live
 pipeline), `ml/eval_islvt.py` (signer from another region), `ml/eval_words.py`, `ml/eval_personal_emergency.py`,
